@@ -107,6 +107,7 @@ pythonpath = ["."]
 
 `.gitignore`:
 ```
+.DS_Store
 .venv/
 __pycache__/
 .pytest_cache/

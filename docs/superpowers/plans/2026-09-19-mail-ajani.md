@@ -31,7 +31,7 @@
 
 Orchestrator = the main Claude session ("Flow"). Two delegate tiers only:
 
-- **Codex** via `codex exec`, model **`gpt-5.6-sol`** for this project (operator decision, 19 Sep 2026). This is a per-project override passed on the command line; the `codex-fleet` skill file keeps its own default and is NOT edited. Effort: `high` for correctness-critical lanes, `medium` for routine lanes.
+- **Codex** via `codex exec`, model **`gpt-5.6-sol`** for this project (operator decision, 19 Sep 2026). This is a per-project override passed on the command line; the `codex-fleet` skill file keeps its own default and is NOT edited. Effort: **`medium` for every lane** (operator decision, 19 Sep 2026); never raise it without asking.
 - **Opus sub-agents** via the Agent tool with explicit `model: "opus"` (never omit the model).
 
 ### Lane table
@@ -40,23 +40,23 @@ Orchestrator = the main Claude session ("Flow"). Two delegate tiers only:
 |---|---|---|---|
 | 1 Skeleton | Flow (hands-on) | main loop | Baseline must be green before any lane spawns; creates venv |
 | 6 Step 1 (fixture) | Flow (hands-on) | main loop | Needs the user's Claude login; Codex sandbox can't reach it |
-| 2 Database | Codex | sol `medium` | Code fully given, mechanical |
+| 2 Database | Codex | sol medium | Code fully given, mechanical |
 | 3 Schedule | Opus | opus | Small, pure |
 | 5 Render | Opus | opus | Small, pure |
-| 6 Steps 2-6 Classifier | Codex | sol `medium` | Code given, fixture already present |
-| 7 Gmail | Codex | sol `high` | External API correctness, never-delete guarantee |
-| 8 Telegram | Codex | sol `medium` | Code given; token-leak test is the key check |
+| 6 Steps 2-6 Classifier | Codex | sol medium | Code given, fixture already present |
+| 7 Gmail | Codex | sol medium | External API correctness, never-delete guarantee |
+| 8 Telegram | Codex | sol medium | Code given; token-leak test is the key check |
 | 12 launchd/scripts/README | Opus | opus | No Python, independent |
-| 4 Learning | Codex | sol `high` | Core trust state machine |
-| 9 Tur | Codex | sol `high` | Orchestration, send-once guarantee |
-| 10 Dinleyici | Codex | sol `high` | Undo/revert state transitions |
+| 4 Learning | Codex | sol medium | Core trust state machine |
+| 9 Tur | Codex | sol medium | Orchestration, send-once guarantee |
+| 10 Dinleyici | Codex | sol medium | Undo/revert state transitions |
 | 11 CLI | Opus | opus | Glue + interactive setup text |
 | Review gate | Opus | opus | Fresh-eyes review of the whole diff vs spec before Task 13 |
 | 13 Live setup | Flow + Oğuzhan | — | Step by step, user present |
 
 ### Waves (a wave starts only when the previous one is green and committed)
 
-- **Wave 0 (Flow):** Preflight `codex exec --skip-git-repo-check --sandbox read-only -m gpt-5.6-sol -c model_reasoning_effort=low "Reply with the single word OK"`; if it fails, stop and report (do not fall back to another model silently). Then Task 1 in full, then Task 6 Step 1 (fixture). Commit.
+- **Wave 0 (Flow):** Preflight `codex exec --skip-git-repo-check --sandbox read-only -m gpt-5.6-sol -c model_reasoning_effort=medium "Reply with the single word OK"`; if it fails, stop and report (do not fall back to another model silently). Then Task 1 in full, then Task 6 Step 1 (fixture). Commit.
 - **Wave 1 (parallel, 7 lanes):** Tasks 2, 3, 5, 6 (Steps 2-6), 7, 8, 12. Disjoint files → shared tree, no worktrees.
 - **Wave 2:** Task 4.
 - **Wave 3 (parallel, 2 lanes):** Tasks 9 and 10 (disjoint files; the shared fakes already exist in `tests/helpers.py` from Task 2).
@@ -72,7 +72,7 @@ Orchestrator = the main Claude session ("Flow"). Two delegate tiers only:
 - Codex spawn (Bash, `run_in_background: true`, stagger 3 s):
   ```bash
   caffeinate -i codex exec --skip-git-repo-check --full-auto \
-    -C ~/Developer/mail-ajani -m gpt-5.6-sol -c model_reasoning_effort=<medium|high> \
+    -C ~/Developer/mail-ajani -m gpt-5.6-sol -c model_reasoning_effort=medium \
     "<BRIEF>" > <scratchpad>/lane-task<N>.log 2>&1
   ```
   `--full-auto` is limited to this repo; the user's go-ahead for execution covers it.

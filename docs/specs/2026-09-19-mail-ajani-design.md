@@ -32,7 +32,7 @@ Kapsam dışı (ilk sürüm): cevap taslağı yazmak, Obsidian'a özet düşmek,
 - Mac o saatte uykudaysa/kapalıysa açılışta kaçırılan tur çalışır; aralık "son başarılı
   turdan bu yana" olarak hesaplanır, arada mail düşmez.
 - Akış:
-  1. Üç hesaptan, son turdan beri gelen yeni mailleri çek (Gmail API, geçmiş kimliğiyle).
+  1. Üç hesaptan, son turdan beri gelen yeni mailleri çek (Gmail API zaman sorgusu, 1 saat örtüşme; tekrar gelen kimlikler veritabanında elenir).
   2. Daha önce Telegram'a gönderilmiş mailleri ele (bir mail asla ikinci kez gönderilmez).
   3. Kesin kuralları uygula (yapay zekâ çağrısı yok).
   4. Kalanları **tek toplu çağrıda** Sonnet'e gönder: gönderen, konu, kısa gövde özeti,

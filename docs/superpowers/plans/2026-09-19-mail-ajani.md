@@ -10,6 +10,8 @@
 
 **Spec:** `docs/specs/2026-09-19-mail-ajani-design.md` (Turkish). Read it before starting any task.
 
+**Execution:** follow the *Execution Strategy* section below (waves, lane assignment, Codex/Opus commands). It overrides the generic sub-skill hint above.
+
 ## Global Constraints
 
 - Zero extra cost: no servers, no paid APIs. AI calls only through `claude -p --model sonnet` (user's Max subscription). Never use `--bare` (it disables subscription OAuth).
@@ -24,6 +26,64 @@
 - All user-facing text (Telegram) is Turkish.
 - Actions are the strings `cop`, `arsiv`, `onemli`, `kalsin`; predictions add `emin_degil`.
 - Repo is private on GitHub (`oguzhan-eryilmaz/mail-ajani`). Commit after every task; never `git add -A`, add files by name.
+
+## Execution Strategy
+
+Orchestrator = the main Claude session ("Flow"). Two delegate tiers only:
+
+- **Codex** via `codex exec`, model **`gpt-5.6-sol`** for this project (operator decision, 19 Sep 2026). This is a per-project override passed on the command line; the `codex-fleet` skill file keeps its own default and is NOT edited. Effort: `high` for correctness-critical lanes, `medium` for routine lanes.
+- **Opus sub-agents** via the Agent tool with explicit `model: "opus"` (never omit the model).
+
+### Lane table
+
+| Task | Lane | Tier | Why |
+|---|---|---|---|
+| 1 Skeleton | Flow (hands-on) | main loop | Baseline must be green before any lane spawns; creates venv |
+| 6 Step 1 (fixture) | Flow (hands-on) | main loop | Needs the user's Claude login; Codex sandbox can't reach it |
+| 2 Database | Codex | sol `medium` | Code fully given, mechanical |
+| 3 Schedule | Opus | opus | Small, pure |
+| 5 Render | Opus | opus | Small, pure |
+| 6 Steps 2-6 Classifier | Codex | sol `medium` | Code given, fixture already present |
+| 7 Gmail | Codex | sol `high` | External API correctness, never-delete guarantee |
+| 8 Telegram | Codex | sol `medium` | Code given; token-leak test is the key check |
+| 12 launchd/scripts/README | Opus | opus | No Python, independent |
+| 4 Learning | Codex | sol `high` | Core trust state machine |
+| 9 Tur | Codex | sol `high` | Orchestration, send-once guarantee |
+| 10 Dinleyici | Codex | sol `high` | Undo/revert state transitions |
+| 11 CLI | Opus | opus | Glue + interactive setup text |
+| Review gate | Opus | opus | Fresh-eyes review of the whole diff vs spec before Task 13 |
+| 13 Live setup | Flow + Oğuzhan | — | Step by step, user present |
+
+### Waves (a wave starts only when the previous one is green and committed)
+
+- **Wave 0 (Flow):** Preflight `codex exec --skip-git-repo-check --sandbox read-only -m gpt-5.6-sol -c model_reasoning_effort=low "Reply with the single word OK"`; if it fails, stop and report (do not fall back to another model silently). Then Task 1 in full, then Task 6 Step 1 (fixture). Commit.
+- **Wave 1 (parallel, 7 lanes):** Tasks 2, 3, 5, 6 (Steps 2-6), 7, 8, 12. Disjoint files → shared tree, no worktrees.
+- **Wave 2:** Task 4.
+- **Wave 3 (parallel, 2 lanes):** Tasks 9 and 10 (disjoint files; the shared fakes already exist in `tests/helpers.py` from Task 2).
+- **Wave 4:** Task 11, then the Opus review gate. Flow fixes or re-dispatches confirmed findings.
+- **Wave 5:** Task 13 with the user.
+
+### Lane rules (every brief states these)
+
+- Brief in English, self-contained, with absolute paths: repo `~/Developer/mail-ajani`, spec and this plan file, the exact task number to implement. The lane reads its task section and implements it exactly (code and tests as written; deviate only if a test proves the plan's code wrong, and report the deviation).
+- **OWNS:** only the files listed in its task's *Files* block. **DO-NOT-TOUCH:** everything else (name the sibling lanes of the same wave).
+- Lanes never run `git`, never `pip install`, never run the whole suite. Acceptance = the task's own test command, e.g. `.venv/bin/pytest tests/test_db.py -v`, with the expected pass count from the plan.
+- Report (in Turkish): files changed, test command output tail, any deviation from the plan.
+- Codex spawn (Bash, `run_in_background: true`, stagger 3 s):
+  ```bash
+  caffeinate -i codex exec --skip-git-repo-check --full-auto \
+    -C ~/Developer/mail-ajani -m gpt-5.6-sol -c model_reasoning_effort=<medium|high> \
+    "<BRIEF>" > <scratchpad>/lane-task<N>.log 2>&1
+  ```
+  `--full-auto` is limited to this repo; the user's go-ahead for execution covers it.
+- Opus spawn: Agent tool, `subagent_type: "general-purpose"`, `model: "opus"`, same brief shape.
+
+### Flow's gate after every wave
+
+1. Re-run each lane's acceptance command itself (lane "done" is a claim, not evidence).
+2. Run the full suite `.venv/bin/pytest -q`; expected counts per wave: W0 4, W1 +37 (=41), W2 +13 (=54), W3 +21 (=75), W4 +2 → **77 total**.
+3. Review the diff against the task text; one commit per task, files added by name.
+4. `git push` at the end of each wave.
 
 ## File Structure
 
@@ -70,7 +130,7 @@ mail-ajani/
 - Create: `pyproject.toml`, `.gitignore`, `mail_ajani/__init__.py`, `mail_ajani/config.py`, `mail_ajani/sirlar.py`, `tests/__init__.py`, `tests/test_config.py`
 
 **Interfaces:**
-- Produces: `config.TZ`, `config.CLAUDE_BIN: str`, `config.KEYRING_SERVICE = "mail-ajani"`, `config.home() -> Path`, `config.db_path() -> Path`, `config.client_secret_path() -> Path`, `config.log_dir() -> Path`, `config.load_config() -> dict` (keys `accounts: list[str]`, `chat_id: int | None`), `config.save_config(cfg: dict) -> None`; `sirlar.get_secret(name) -> str | None`, `sirlar.set_secret(name, value) -> None`.
+- Produces: `config.TZ`, `config.CLAUDE_BIN: str`, `config.KEYRING_SERVICE = "mail-ajani"`, `config.home() -> Path`, `config.db_path() -> Path`, `config.client_secret_path(account: str | None = None) -> Path` (per-domain file `client_secret-<domain>.json` if present, else `client_secret.json`), `config.log_dir() -> Path`, `config.load_config() -> dict` (keys `accounts: list[str]`, `chat_id: int | None`), `config.save_config(cfg: dict) -> None`; `sirlar.get_secret(name) -> str | None`, `sirlar.set_secret(name, value) -> None`.
 
 - [ ] **Step 1: Create packaging files**
 
@@ -153,6 +213,13 @@ def test_config_roundtrip(tmp_path, monkeypatch):
     assert config.load_config() == {"accounts": ["a@gmail.com"], "chat_id": 42}
 
 
+def test_client_secret_per_domain(tmp_path, monkeypatch):
+    monkeypatch.setenv("MAIL_AJANI_HOME", str(tmp_path))
+    assert config.client_secret_path("a@gmail.com") == tmp_path / "client_secret.json"
+    (tmp_path / "client_secret-eryondigital.com.json").write_text("{}")
+    assert config.client_secret_path("x@eryondigital.com") == tmp_path / "client_secret-eryondigital.com.json"
+
+
 def test_secrets_use_service_name(monkeypatch):
     store = {}
     monkeypatch.setattr(sirlar.keyring, "set_password", lambda s, n, v: store.__setitem__((s, n), v))
@@ -192,7 +259,11 @@ def db_path() -> Path:
     return home() / "ajan.db"
 
 
-def client_secret_path() -> Path:
+def client_secret_path(account: str | None = None) -> Path:
+    if account:
+        per_domain = home() / f"client_secret-{account.split('@')[-1]}.json"
+        if per_domain.exists():
+            return per_domain
     return home() / "client_secret.json"
 
 
@@ -231,7 +302,7 @@ def set_secret(name: str, value: str) -> None:
 - [ ] **Step 6: Run tests to verify they pass**
 
 Run: `.venv/bin/pytest tests/test_config.py -v`
-Expected: 3 passed
+Expected: 4 passed
 
 - [ ] **Step 7: Commit**
 
@@ -261,7 +332,7 @@ git commit -m "feat: proje iskeleti, ayarlar ve anahtar zinciri"
   - `active_decision(conn, mail_id) -> Row | None` (latest non-undone)
   - `mark_undone(conn, decision_id) -> None`
   - `get_meta(conn, key) -> str | None`, `set_meta(conn, key, value: str) -> None`
-- Test helpers (`tests/helpers.py`): `ts(i: int) -> str`, `make_mail(conn, sender=..., account=..., subject=..., prediction=None, category=...) -> int`
+- Test helpers (`tests/helpers.py`): `ts(i: int) -> str`, `make_mail(conn, sender=..., account=..., subject=..., prediction=None, category=...) -> int`, and fakes used by Tasks 9-10: `FakeGmail(account, mails=None, fail=None)` (records `applied`, `reverted`, `since`), `FakeTg()` (records `sent`, `edited`, `answered`; `send` returns incrementing ids from 101), `raw_mail(account, gid, sender=..., subject=...) -> dict`
 
 - [ ] **Step 1: Write test helpers and fixture**
 
@@ -291,6 +362,48 @@ def make_mail(conn, sender="haber@site.com", account="a@gmail.com", subject="Kon
     if prediction:
         db.set_prediction(conn, mail_id, prediction, "kısa özet")
     return mail_id
+
+
+class FakeGmail:
+    def __init__(self, account, mails=None, fail=None):
+        self.account = account
+        self.mails = mails or []
+        self.fail = fail
+        self.applied, self.reverted, self.since = [], [], None
+
+    def fetch_new(self, since):
+        self.since = since
+        if self.fail:
+            raise self.fail
+        return list(self.mails)
+
+    def apply(self, gmail_id, action):
+        self.applied.append((gmail_id, action))
+
+    def revert(self, gmail_id, action):
+        self.reverted.append((gmail_id, action))
+
+
+class FakeTg:
+    def __init__(self):
+        self.sent, self.edited, self.answered = [], [], []
+        self._next = 100
+
+    def send(self, text, keyboard=None, silent=False):
+        self._next += 1
+        self.sent.append({"id": self._next, "text": text, "keyboard": keyboard, "silent": silent})
+        return self._next
+
+    def edit(self, message_id, text, keyboard=None):
+        self.edited.append({"id": message_id, "text": text, "keyboard": keyboard})
+
+    def answer(self, callback_id, text=""):
+        self.answered.append(text)
+
+
+def raw_mail(account, gid, sender="s@x.com", subject="Konu"):
+    return {"account": account, "gmail_id": gid, "sender": sender, "sender_name": "S", "subject": subject,
+            "snippet": "p", "category": "birincil", "received_at": ts(int(gid.strip("g") or 0))}
 ```
 
 `tests/conftest.py`:
@@ -1069,7 +1182,7 @@ git commit -m "feat: Telegram kart, özet ve kural metinleri"
   - `parse_output(stdout: str, expected_ids: set[int]) -> dict[int, tuple[str, str]]`
   - `classify(mails, examples, runner=subprocess.run) -> tuple[dict[int, tuple[str, str]], list[str]]` → (predictions keyed by mail id as `(karar, ozet)`, list of error strings; one per failed chunk). Never raises.
 
-- [ ] **Step 1: Capture real CLI output (spike, determines parse_output)**
+- [ ] **Step 1: Capture real CLI output (spike, determines parse_output)** — *done by Flow in Wave 0; the Codex lane starts at Step 2 and must not re-run it*
 
 Run from a neutral directory so no CLAUDE.md is picked up:
 ```bash
@@ -1281,7 +1394,7 @@ git commit -m "feat: Sonnet ile toplu sınıflandırma (claude -p)"
 - Create: `mail_ajani/gmail.py`, `tests/test_gmail.py`
 
 **Interfaces:**
-- Consumes: `config.TZ`, `config.client_secret_path()`, `sirlar.get_secret/set_secret`.
+- Consumes: `config.TZ`, `config.client_secret_path(account)`, `sirlar.get_secret/set_secret`.
 - Produces:
   - `SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]`, `LABEL_ARSIV = "Ajan/Arşiv"`, `LABEL_ONEMLI = "Ajan/Önemli"`
   - `class GmailAuthError(Exception)`
@@ -1502,7 +1615,7 @@ def build_client(account: str) -> GmailClient:
 def authorize(account: str) -> None:
     from google_auth_oauthlib.flow import InstalledAppFlow
 
-    flow = InstalledAppFlow.from_client_secrets_file(str(config.client_secret_path()), SCOPES)
+    flow = InstalledAppFlow.from_client_secrets_file(str(config.client_secret_path(account)), SCOPES)
     creds = flow.run_local_server(port=0, login_hint=account, prompt="consent", access_type="offline")
     sirlar.set_secret(f"gmail:{account}", creds.to_json())
 ```
@@ -1673,57 +1786,17 @@ git commit -m "feat: Telegram istemcisi (anahtar hata metnine sızmaz)"
 
 **Files:**
 - Create: `mail_ajani/tur.py`, `tests/test_tur.py`
-- Modify: `tests/helpers.py` (add fakes)
 
 **Interfaces:**
 - Consumes: `db`, `learning`, `render`, `schedule`; clients with `fetch_new/apply/revert`; tg with `send`; `classify_fn(mails, examples) -> (dict, list[str])`.
 - Produces: `run_tur(conn, clients: dict[str, GmailClient], tg, classify_fn, now: datetime, force: bool = False, warnings: list[str] | None = None) -> dict` returning `{"skipped": True}` or `{"new": int, "auto": int, "cards": int, "warnings": int}`.
 - Meta keys: `last_run` (ISO), `last_fetch:<account>` (ISO).
 
-- [ ] **Step 1: Add fakes to `tests/helpers.py`** (append)
+- [ ] **Step 1: Confirm the shared fakes exist** (created in Task 2)
 
-```python
-class FakeGmail:
-    def __init__(self, account, mails=None, fail=None):
-        self.account = account
-        self.mails = mails or []
-        self.fail = fail
-        self.applied, self.reverted, self.since = [], [], None
+Run: `grep -n 'class FakeGmail\|class FakeTg\|def raw_mail' tests/helpers.py`
+Expected: 3 matches
 
-    def fetch_new(self, since):
-        self.since = since
-        if self.fail:
-            raise self.fail
-        return list(self.mails)
-
-    def apply(self, gmail_id, action):
-        self.applied.append((gmail_id, action))
-
-    def revert(self, gmail_id, action):
-        self.reverted.append((gmail_id, action))
-
-
-class FakeTg:
-    def __init__(self):
-        self.sent, self.edited, self.answered = [], [], []
-        self._next = 100
-
-    def send(self, text, keyboard=None, silent=False):
-        self._next += 1
-        self.sent.append({"id": self._next, "text": text, "keyboard": keyboard, "silent": silent})
-        return self._next
-
-    def edit(self, message_id, text, keyboard=None):
-        self.edited.append({"id": message_id, "text": text, "keyboard": keyboard})
-
-    def answer(self, callback_id, text=""):
-        self.answered.append(text)
-
-
-def raw_mail(account, gid, sender="s@x.com", subject="Konu"):
-    return {"account": account, "gmail_id": gid, "sender": sender, "sender_name": "S", "subject": subject,
-            "snippet": "p", "category": "birincil", "received_at": ts(int(gid.strip("g") or 0))}
-```
 
 - [ ] **Step 2: Write the failing test**
 
@@ -1954,7 +2027,7 @@ Expected: 11 passed
 - [ ] **Step 6: Commit**
 
 ```bash
-git add mail_ajani/tur.py tests/test_tur.py tests/helpers.py
+git add mail_ajani/tur.py tests/test_tur.py
 git commit -m "feat: günde 4 tur: kural, Sonnet tahmini, Telegram kartları"
 ```
 
@@ -2391,8 +2464,8 @@ def cmd_bot_kur() -> int:
 
 
 def cmd_hesap_ekle(email: str) -> int:
-    if not config.client_secret_path().exists():
-        print(f"Önce Google izin dosyasını şuraya koy: {config.client_secret_path()}")
+    if not config.client_secret_path(email).exists():
+        print(f"Önce Google izin dosyasını şuraya koy: {config.client_secret_path(email)}")
         return 2
     print(f"Tarayıcı açılacak: {email} hesabıyla giriş yapıp izin ver.")
     gmail.authorize(email)
@@ -2432,7 +2505,7 @@ def main(argv: list[str] | None = None) -> int:
 - [ ] **Step 4: Run the full suite**
 
 Run: `.venv/bin/pytest -v`
-Expected: 76 passed
+Expected: 77 passed
 
 - [ ] **Step 5: Commit**
 
@@ -2584,14 +2657,10 @@ This task is done together with the user, one step at a time, and only after the
   `cd ~/Developer/mail-ajani && .venv/bin/python -m mail_ajani bot-kur`
   Expected: "✅ Mail Ajanı bağlandı" arrives on the phone.
 
-- [ ] **Step 2: Google Cloud project (free)** — In console.cloud.google.com, signed in with the personal Gmail:
-  1. New project `mail-ajani`.
-  2. APIs & Services → Library → enable **Gmail API**.
-  3. OAuth consent screen (Google Auth Platform) → Audience **External**; add the three addresses as test users; Data access → add scope `https://www.googleapis.com/auth/gmail.modify`.
-  4. **Publish app → In production.** Required: in "Testing" mode refresh tokens expire after 7 days and the agent would lose access every week. Unverified is fine for personal use; the consent screen will show a "Google hasn't verified this app" warning → Advanced → continue.
-  5. Clients → Create client → **Desktop app** → download JSON → save as
-     `~/Library/Application Support/mail-ajani/client_secret.json`.
-  If a Workspace account's admin blocks third-party apps: Admin console → Security → Access and data control → API controls → trust the app's client ID. Ask the user whether they are the Workspace admin before this step.
+- [ ] **Step 2: Google OAuth clients (free)** — Oğuzhan is the Workspace admin, so Workspace accounts use an **Internal** app (no verification, no 7-day token expiry). First ask: which domain(s) are the two Workspace accounts on? One Internal project per Workspace org.
+  1. **Workspace org(s):** in console.cloud.google.com under that org, project `mail-ajani` (or reuse the existing `oguzhan-studio` project in the eryondigital.com org). Enable **Gmail API**. OAuth consent / Google Auth Platform → Audience **Internal**; Data access → scope `https://www.googleapis.com/auth/gmail.modify`. Clients → **Desktop app** → download JSON → save as `~/Library/Application Support/mail-ajani/client_secret-<domain>.json` (e.g. `client_secret-eryondigital.com.json`).
+  2. **Personal Gmail:** Internal is impossible for @gmail.com. Separate project under "No organization", Audience **External**, add the address as test user, same scope, **Publish app → In production** (in Testing, refresh tokens expire every 7 days). If Google blocks publishing because `gmail.modify` is a restricted scope needing verification, fall back to Testing mode: the agent keeps working but the personal account needs `hesap-ekle` once a week; the tur's warning message tells when. Save its Desktop client JSON as `client_secret.json` (the default file).
+  3. If a Workspace admin policy blocks the app: Admin console → Security → Access and data control → API controls → mark the client ID as trusted.
 
 - [ ] **Step 3: First account, dry run** — User runs `.venv/bin/python -m mail_ajani hesap-ekle <kişisel adres>`, approves in the browser. Agent then runs `.venv/bin/python -m mail_ajani tur --force`.
   Expected: summary + cards for the last 24 h of inbox mail on the phone; each card shows a Sonnet prediction (not "tahmin yok"). If predictions are missing, read `~/Library/Logs/mail-ajani/tur.log` and fix before continuing.

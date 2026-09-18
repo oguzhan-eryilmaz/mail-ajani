@@ -102,8 +102,10 @@ kart olarak gelir. Otomatik davranış yalnız aşağıdaki eşikler aşılınca
 ## Kurulumda Oğuzhan'ın yapacakları
 
 1. Telegram'da BotFather ile bot açmak (anahtar doğrudan Anahtar Zinciri'ne girilir).
-2. Google Cloud'da ücretsiz bir proje ve OAuth izni; üç hesap için birer kez "izin ver".
-   Workspace hesaplarında yönetici izni gerekebilir.
+2. Google Cloud'da ücretsiz OAuth izni; üç hesap için birer kez "izin ver". Oğuzhan Workspace
+   yöneticisi: Workspace hesapları **Internal** uygulamayla bağlanır (doğrulama ve 7 gün sınırı yok).
+   Kişisel Gmail ayrı bir External uygulamayla bağlanır; Google yayına almaya izin vermezse o hesap
+   haftada bir yeniden izin ister.
 3. Mac'in uyku ayarı: sistem uyumasın (ekran kapanabilir).
 
 ## Test

@@ -1,6 +1,6 @@
 # Mail Ajanı: Tasarım
 
-Tarih: 19 Eylül 2026 · Durum: Oğuzhan onayı bekliyor
+Tarih: 19 Eylül 2026 · Durum: Oğuzhan onayladı (19 Eylül 2026)
 
 ## Amaç
 

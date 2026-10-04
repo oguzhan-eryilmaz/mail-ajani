@@ -1,7 +1,11 @@
+import base64
 import json
+import re
 from datetime import datetime
+from email.message import Message
 from email.utils import parseaddr
 from html import unescape
+from html.parser import HTMLParser
 
 from . import config, sirlar
 
@@ -10,6 +14,72 @@ LABEL_ARSIV = "Ajan/Arşiv"
 LABEL_ONEMLI = "Ajan/Önemli"
 CATEGORIES = {"CATEGORY_PROMOTIONS": "tanitim", "CATEGORY_SOCIAL": "sosyal",
               "CATEGORY_UPDATES": "guncelleme", "CATEGORY_FORUMS": "forum"}
+
+
+class _ReadableHTML(HTMLParser):
+    BLOCKS = {"address", "article", "blockquote", "div", "dl", "dt", "dd", "footer",
+              "h1", "h2", "h3", "h4", "h5", "h6", "header", "li", "main", "ol", "p",
+              "pre", "section", "table", "tr", "ul"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.text = []
+        self.hidden = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in {"script", "style"}:
+            self.hidden += 1
+        elif not self.hidden and tag == "br":
+            self.text.append("\n")
+
+    def handle_endtag(self, tag):
+        if tag in {"script", "style"}:
+            self.hidden = max(0, self.hidden - 1)
+        elif not self.hidden and tag in self.BLOCKS:
+            self.text.append("\n")
+
+    def handle_data(self, data):
+        if not self.hidden:
+            self.text.append(data)
+
+
+def _clean_body(text: str) -> str:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    text = "\n".join(line.rstrip() for line in text.split("\n"))
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def _body_text(payload: dict) -> str:
+    plain, html = [], []
+
+    def walk(part):
+        headers = Message()
+        for header in part.get("headers", []):
+            headers[header["name"]] = header["value"]
+        if part.get("filename") or headers.get_content_disposition() == "attachment":
+            return
+        mime = part.get("mimeType", "").lower()
+        data = part.get("body", {}).get("data")
+        if data and mime in {"text/plain", "text/html"}:
+            raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
+            charset = headers.get_content_charset() or "utf-8"
+            try:
+                text = raw.decode(charset, errors="replace")
+            except LookupError:
+                text = raw.decode("utf-8", errors="replace")
+            if mime == "text/html":
+                parser = _ReadableHTML()
+                parser.feed(text)
+                parser.close()
+                text = "".join(parser.text)
+            text = _clean_body(text)
+            if text:
+                (plain if mime == "text/plain" else html).append(text)
+        for child in part.get("parts", []):
+            walk(child)
+
+    walk(payload)
+    return _clean_body("\n\n".join(plain or html))
 
 
 class GmailAuthError(Exception):
@@ -66,6 +136,10 @@ class GmailClient:
                         "subject": headers.get("subject", ""), "snippet": unescape(msg.get("snippet", "")),
                         "category": category, "received_at": received.isoformat()})
         return out
+
+    def fetch_body(self, gmail_id: str) -> str:
+        msg = self._messages().get(userId="me", id=gmail_id, format="full").execute(num_retries=3)
+        return _body_text(msg.get("payload", {}))
 
     def count_since(self, since: datetime, limit: int) -> int:
         # Cheap pre-check for backlog scans: ids only, stops just past the limit.

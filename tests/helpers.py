@@ -25,10 +25,13 @@ def make_mail(conn, sender="haber@site.com", account="a@gmail.com", subject="Kon
 
 
 class FakeGmail:
-    def __init__(self, account, mails=None, fail=None):
+    def __init__(self, account, mails=None, fail=None, bodies=None, body_fail=None):
         self.account = account
         self.mails = mails or []
         self.fail = fail
+        self.bodies = bodies or {}
+        self.body_fail = body_fail
+        self.body_fetches = []
         self.applied, self.reverted, self.since = [], [], None
 
     def fetch_new(self, since):
@@ -36,6 +39,12 @@ class FakeGmail:
         if self.fail:
             raise self.fail
         return list(self.mails)
+
+    def fetch_body(self, gmail_id):
+        self.body_fetches.append(gmail_id)
+        if self.body_fail:
+            raise self.body_fail
+        return self.bodies.get(gmail_id, "")
 
     def apply(self, gmail_id, action):
         self.applied.append((gmail_id, action))

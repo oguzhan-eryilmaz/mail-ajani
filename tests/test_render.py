@@ -1,4 +1,6 @@
 from mail_ajani import render
+from html import unescape
+import pytest
 
 MAIL = {"id": 7, "account": "a@gmail.com", "sender": "x@y.com", "sender_name": "X <b>",
         "subject": "Fatura & ödeme", "snippet": "ham", "summary": "Ekim faturası geldi", "prediction": "onemli"}
@@ -90,3 +92,47 @@ def test_warning_messages_split_and_escape():
     assert sum(len(items) for _, items in msgs) == 31
     assert "&lt;x&gt;" in msgs[0][0] and "…" in msgs[0][0]
     assert render.warning_messages([]) == []
+
+
+def test_full_body_single_message_is_escaped_and_has_short_subject():
+    messages = render.full_body_messages("Konu <Ekim>", 'Tam <metin> & "ş" 😀')
+    assert messages == ['📄 Tam metin · Konu &lt;Ekim&gt;\nTam &lt;metin&gt; &amp; &quot;ş&quot; 😀']
+    assert render.full_body_messages("Konu", "") == []
+    assert render.full_body_messages("", "metin") == ['📄 Tam metin · (konu yok)\nmetin']
+
+
+@pytest.mark.parametrize("body", ["x" * 100_000, '<&😀𐐷>"' * 20_000])
+def test_full_body_long_text_is_capped_numbered_and_within_escaped_utf16_limit(body):
+    from html.parser import HTMLParser
+
+    class TextOnlyParser(HTMLParser):
+        def handle_starttag(self, tag, attrs):
+            pytest.fail("Mail HTML'i Telegram işaretlemesine dönüşmemeli")
+
+        def handle_data(self, data):
+            decoded.append(data)
+
+    messages = render.full_body_messages('<&😀𐐷>' * 1000, body)
+    assert len(messages) == 4
+    for i, text in enumerate(messages, 1):
+        assert len(text.encode('utf-16-le')) // 2 < 4096
+        assert text.split('\n', 1)[0].endswith(f'({i}/4)')
+        assert text.startswith('📄 Tam metin · &lt;&amp;😀𐐷&gt;')
+        decoded = []
+        parser = TextOnlyParser()
+        chunk = text.split('\n', 1)[1]
+        parser.feed(chunk)
+        parser.close()
+        assert ''.join(decoded) == unescape(chunk)
+    assert messages[-1].endswith("… devamı Gmail'de")
+    recovered = ''.join(unescape(m.split('\n', 1)[1]) for m in messages)
+    assert body.startswith(recovered.removesuffix("\n… devamı Gmail'de"))
+
+
+@pytest.mark.parametrize("body", ['<&😀𐐷>"' * 600, 'ş\n' * 2500, "x" * 16000])
+def test_full_body_split_does_not_lose_or_duplicate_text(body):
+    messages = render.full_body_messages("Kısa konu", body)
+    assert 1 < len(messages) <= 4
+    assert all(len(m.encode('utf-16-le')) // 2 < 4096 for m in messages)
+    assert not messages[-1].endswith("… devamı Gmail'de")
+    assert ''.join(unescape(m.split('\n', 1)[1]) for m in messages) == body

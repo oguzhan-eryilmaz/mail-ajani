@@ -1,4 +1,5 @@
 import logging
+import base64
 
 import pytest
 from googleapiclient.http import HttpRequest
@@ -11,6 +12,94 @@ from unittest.mock import MagicMock
 
 from mail_ajani.config import TZ
 from mail_ajani.gmail import GmailClient
+
+
+def body_part(mime, text, charset=None, *, encoding="utf-8", filename=""):
+    data = text.encode(encoding) if isinstance(text, str) else text
+    content_type = mime + (f'; charset="{charset}"' if charset is not None else '')
+    return {"mimeType": mime, "filename": filename,
+            "headers": [{"name": "Content-Type", "value": content_type}],
+            "body": {"data": base64.urlsafe_b64encode(data).decode().rstrip("=")}}
+
+
+def read_body(payload):
+    svc, msgs, lab = service_with([{"id": "m1", "payload": payload}])
+    text = GmailClient("a", svc).fetch_body("m1")
+    msgs.get.assert_called_once_with(userId="me", id="m1", format="full")
+    msgs.get.return_value.execute.assert_called_once_with(num_retries=3)
+    # Fetching a body is a single read, with no label or read-state mutations.
+    assert [call[0] for call in msgs.mock_calls] == ["get", "get().execute"]
+    assert lab.mock_calls == []
+    return text
+
+
+def test_fetch_body_plain_normalizes_whitespace_and_charset():
+    part = body_part("text/plain", "  Merhaba ş  \r\n\r\n \r\n\r\nSon\t  \r\n",
+                     "iso-8859-9", encoding="iso-8859-9")
+    assert read_body(part) == "Merhaba ş\n\nSon"
+
+
+def test_fetch_body_html_only_drops_scripts_styles_and_unescapes():
+    part = body_part("text/html", '<style>GİZLİ CSS</style><div>Merhaba &amp; iyi<br>günler</div>'
+                     '<script>GİZLİ JS</script><p>&lt;b&gt; &quot;ş&quot; &#128512;</p>'
+                     '<div>Son &amp;lt;</div>')
+    assert read_body(part) == 'Merhaba & iyi\ngünler\n<b> "ş" 😀\nSon &lt;'
+
+
+@pytest.mark.parametrize("parts", [
+    [body_part("text/html", "<p>HTML sürümü</p>"), body_part("text/plain", "Düz sürüm")],
+    [body_part("text/plain", "Düz sürüm"), body_part("text/html", "<p>HTML sürümü</p>")],
+])
+def test_fetch_body_alternative_prefers_plain_regardless_of_order(parts):
+    assert read_body({"mimeType": "multipart/alternative", "parts": parts}) == "Düz sürüm"
+
+
+def test_fetch_body_walks_nested_mime_and_skips_attachment_subtrees():
+    payload = {"mimeType": "multipart/mixed", "parts": [
+        body_part("text/plain", "EK GİZLİ", filename="not.txt"),
+        {"mimeType": "multipart/mixed", "filename": "ilet.eml",
+         "parts": [body_part("text/plain", "EK ALT AĞACI")]},
+        {"mimeType": "multipart/related", "parts": [
+            body_part("image/png", b"\x00\xff"),
+            {"mimeType": "multipart/alternative", "parts": [
+                body_part("text/html", "<p>HTML</p>"), body_part("text/plain", "Ana metin")]},
+            body_part("text/plain", "İkinci bölüm")]}]}
+    assert read_body(payload) == "Ana metin\n\nİkinci bölüm"
+
+
+@pytest.mark.parametrize("charset, data, expected", [
+    (None, "ş😀".encode(), "ş😀"),
+    ("yanlis-karakter-seti", "ş😀".encode(), "ş😀"),
+    ("utf-8", b"A\xffB", "A�B"),
+    ("ascii", "ş".encode(), "��"),
+])
+def test_fetch_body_missing_unknown_or_wrong_charset_uses_replacement(charset, data, expected):
+    assert read_body(body_part("text/plain", data, charset)) == expected
+
+
+@pytest.mark.parametrize("payload", [{}, {"mimeType": "image/png", "body": {"data": "AA"}},
+    body_part("text/plain", " \n \n"), body_part("text/plain", "ek", filename="ek.txt"),
+    {"mimeType": "text/plain", "body": {"attachmentId": "external"}},
+    body_part("text/html", "<script>secret</script><style>secret</style>")])
+def test_fetch_body_returns_empty_when_no_readable_text(payload):
+    assert read_body(payload) == ""
+
+
+def test_fetch_body_empty_plain_falls_back_to_readable_html():
+    assert read_body({"mimeType": "multipart/alternative", "parts": [
+        body_part("text/plain", "  "), body_part("text/html", "<p>Okunur</p>")]}) == "Okunur"
+
+
+@pytest.mark.parametrize("error", [RuntimeError("https://invalid/SECRET"),
+    HttpError(Response({"status": 404}), b'{"error":{"message":"SECRET"}}'),
+    HttpError(Response({"status": 401}), b'{"error":{"message":"SECRET"}}')])
+def test_fetch_body_propagates_errors_without_logging_or_mutation(error, caplog):
+    svc, msgs, _ = service_with([])
+    msgs.get.return_value.execute.side_effect = error
+    with pytest.raises(type(error)):
+        GmailClient("a", svc).fetch_body("missing")
+    assert [call[0] for call in msgs.mock_calls] == ["get", "get().execute"]
+    assert "SECRET" not in caplog.text and "https://" not in caplog.text
 
 
 def service_with(messages, labels=None):

@@ -115,6 +115,11 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
         return (f"Mail #{mail['id']} ({mail['account']} · {(mail['sender'] or '')[:80]} · {subject}): "
                 "kısa kart da reddedildi. Mail yerelde kayıtlı; Gmail'den kontrol edin.")
 
+    def body_warning(mail, reason):
+        subject = (mail["subject"] or "(konu yok)")[:80]
+        return (f"Mail #{mail['id']} ({mail['account']} · {(mail['sender'] or '')[:80]} · {subject}): "
+                f"{reason}")
+
     def send(text, keyboard=None):
         nonlocal sent_any
         if sent_any:
@@ -192,6 +197,30 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
                         warnings.append(rejected[mail["id"]])
                         continue
                 db.mark_sent(conn, mail["id"], message_id, now_iso)
+                decision = active[mail["id"]]
+                if (decision and decision["action"] == "onemli"
+                        and decision["source"] in {"rule", "style"}):
+                    try:
+                        body = clients[mail["account"]].fetch_body(mail["gmail_id"])
+                    except Exception:
+                        # Never log exception details or persist mail body text.
+                        warnings.append(body_warning(mail, "tam metin okunamadı; Gmail'den kontrol edin."))
+                        continue
+                    for text in render.full_body_messages(mail["subject"], body):
+                        try:
+                            send(text)
+                        except TelegramError as e:
+                            if e.permanent:
+                                warnings.append(body_warning(mail, "Telegram tam metni reddetti; "
+                                                             "kalan parçalar gönderilmedi. Gmail'den kontrol edin."))
+                                break
+                            # The card is already durable. Drop the remaining body
+                            # on resume, including any ambiguously delivered part,
+                            # and persist only this warning via the outer handler.
+                            warnings.append(body_warning(mail, "tam metin gönderimi tamamlanamadı; "
+                                                         "tekrar göndermemek için kalan parçalar bırakıldı. "
+                                                         "Gmail'den kontrol edin."))
+                            raise
         warnings = [w for w in dict.fromkeys(warnings) if w not in warned]
         if warnings:
             db.set_meta(conn, "pending_warnings", json.dumps(warnings, ensure_ascii=False))

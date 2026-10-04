@@ -1,9 +1,12 @@
 import pytest
+from googleapiclient.errors import HttpError
+from httplib2 import Response
+from mail_ajani.gmail import GmailAuthError
 from mail_ajani.telegram import TelegramError
 
 from datetime import datetime, timedelta
 
-from mail_ajani import db, learning, tur
+from mail_ajani import db, learning, render, tur
 from mail_ajani.config import TZ
 from tests.helpers import FakeGmail, FakeTg, make_mail, raw_mail, ts
 
@@ -714,3 +717,263 @@ def test_backlog_lookback_widens_window_once_without_duplicates(conn):
     g.mails.append(raw_mail('a', 'g9', subject='eski'))
     tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=10), force=True, lookback=timedelta(days=30))
     assert sum('a:cop:' in str(m['keyboard']) for m in tg.sent) == 4
+
+
+@pytest.mark.parametrize('source', ['rule', 'style'])
+@pytest.mark.parametrize('now', [NOON, NIGHT])
+def test_auto_important_body_follows_unchanged_card_once_with_same_pacing(conn, monkeypatch, caplog, source, now):
+    if source == 'rule':
+        train_rule(conn, 'onemli')
+    else:
+        monkeypatch.setattr(learning, 'style_authorities', lambda conn: {'onemli'})
+    def ai(mails, examples):
+        return {m['id']: ('onemli', 'Kısa özet') for m in mails}, []
+    body = 'TAM GÖVDE <&> 😀' * 400
+    g = FakeGmail('a', [raw_mail('a', 'g900', sender='auto@x.com', subject='İş maili'),
+                        raw_mail('a', 'g901', sender='other@x.com', subject='Sonraki kart')],
+                  bodies={'g900': body})
+    # Only the first sender is covered by style in this test.
+    if source == 'style':
+        def ai(mails, examples):
+            return {m['id']: ('onemli' if m['sender'] == 'auto@x.com' else 'kalsin', 'Kısa özet')
+                    for m in mails}, []
+    waits = []
+    monkeypatch.setattr(tur, 'sleep', waits.append)
+    tg = FakeTg()
+    stats = tur.run_tur(conn, {'a': g}, tg, ai, now, warnings=['b: izin yok'])
+    assert 'incomplete' not in stats
+    mail = conn.execute("SELECT * FROM mails WHERE gmail_id='g900'").fetchone()
+    decision = db.active_decision(conn, mail['id'])
+    assert decision['source'] == source and decision['notified_at'] == now.isoformat()
+    assert tg.sent[1]['text'] == render.card_text(mail)
+    assert tg.sent[1]['keyboard'] == render.card_keyboard(mail['id'])
+    parts = render.full_body_messages(mail['subject'], body)
+    assert [m['text'] for m in tg.sent[2:2 + len(parts)]] == parts
+    assert all(m['keyboard'] is None for m in tg.sent[2:2 + len(parts)])
+    assert 'Sonraki kart' in tg.sent[-2]['text'] and 'Uyarı' in tg.sent[-1]['text']
+    assert mail['tg_message_id'] == tg.sent[1]['id'] and mail['sent_at'] == now.isoformat()
+    assert g.body_fetches == ['g900'] and g.applied == [('g900', 'onemli')]
+    assert 'TAM GÖVDE' not in caplog.text + '\n'.join(conn.iterdump())
+    assert waits == [tur.SEND_INTERVAL_S] * (len(tg.sent) - 1)
+    assert all(m['silent'] == (now == NIGHT) for m in tg.sent)
+    assert db.pending_mails(conn) == []
+    count = len(tg.sent)
+    tur.run_tur(conn, {'a': g}, tg, ai, now + timedelta(minutes=15), force=True)
+    assert len(tg.sent) == count and g.body_fetches == ['g900']
+    assert g.applied == [('g900', 'onemli')]
+
+
+def test_important_prediction_and_owner_star_do_not_fetch_full_body(conn):
+    def ai(mails, examples):
+        return {m['id']: ('onemli', 'Özet') for m in mails}, []
+    g = FakeGmail('a', [raw_mail('a', 'g900')], bodies={'g900': 'TAM GÖVDE'})
+    tg = FakeTg()
+    tur.run_tur(conn, {'a': g}, tg, ai, NOON)
+    mail = conn.execute("SELECT * FROM mails WHERE gmail_id='g900'").fetchone()
+    assert len(tg.sent) == 2 and 'Tahmin: önemli' in tg.sent[1]['text']
+    assert g.applied == [] and g.body_fetches == []
+    learning.record_user_decision(conn, mail['id'], 'onemli', ts(1000))
+    tur.run_tur(conn, {'a': g}, tg, ai, NOON + timedelta(minutes=15), force=True)
+    assert len(tg.sent) == 2 and g.body_fetches == []
+    # Even a user decision created before delivery never opts into full text.
+    mid = make_mail(conn, account='a')
+    learning.record_user_decision(conn, mid, 'onemli', ts(1001))
+    tur.run_tur(conn, {'a': g}, tg, ai, NOON + timedelta(minutes=16), force=True)
+    assert len(tg.sent) == 2 and g.body_fetches == []
+
+
+@pytest.mark.parametrize('action', ['cop', 'arsiv', 'kalsin'])
+def test_other_auto_actions_do_not_fetch_body(conn, monkeypatch, action):
+    monkeypatch.setattr(learning, 'style_authorities', lambda conn: {action})
+    def ai(mails, examples):
+        return {m['id']: (action, 'Özet') for m in mails}, []
+    g = FakeGmail('a', [raw_mail('a', 'g900')], bodies={'g900': 'TAM GÖVDE'})
+    tur.run_tur(conn, {'a': g}, FakeTg(), ai, NOON)
+    assert g.body_fetches == []
+
+
+@pytest.mark.parametrize('error', [RuntimeError('https://invalid/SECRET'),
+    GmailAuthError('SECRET'),
+    HttpError(Response({'status': 404}), b'{"error":{"message":"SECRET"}}')])
+def test_fetch_body_failure_keeps_card_sent_and_completes_with_identified_warning(conn, caplog, error):
+    train_rule(conn, 'onemli')
+    subject = 'Ekstre <Ekim> ' + 'x' * 200
+    g = FakeGmail('a', [raw_mail('a', 'g900', sender='auto@x.com', subject=subject),
+                        raw_mail('a', 'g901', sender='other@x.com', subject='Sonraki')], body_fail=error)
+    tg = FakeTg()
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    assert 'incomplete' not in stats and len(tg.sent) == 4
+    assert 'Sonraki' in tg.sent[2]['text']
+    warning = tg.sent[-1]['text']
+    assert warning.count('tam metin okunamadı') == 1
+    assert 'a · auto@x.com · Ekstre &lt;Ekim&gt;' in warning
+    assert 'x' * 100 not in warning
+    mail = conn.execute("SELECT * FROM mails WHERE gmail_id='g900'").fetchone()
+    assert mail['sent_at'] == NOON.isoformat() and mail['tg_message_id'] == tg.sent[1]['id']
+    assert db.get_meta(conn, 'tur_incomplete') == '0' and db.pending_mails(conn) == []
+    assert 'SECRET' not in caplog.text + str(tg.sent) + '\n'.join(conn.iterdump())
+    assert 'https://' not in caplog.text + str(tg.sent)
+    tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(hours=6))
+    assert g.body_fetches == ['g900'] and len(tg.sent) == 4
+    assert g.applied == [('g900', 'onemli')]
+
+
+def test_empty_body_has_no_followup_or_warning(conn):
+    train_rule(conn, 'onemli')
+    g = FakeGmail('a', [raw_mail('a', 'g900', sender='auto@x.com')])
+    tg = FakeTg()
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    assert 'incomplete' not in stats and stats['warnings'] == 0
+    assert len(tg.sent) == 2 and g.body_fetches == ['g900']
+    assert db.pending_mails(conn) == []
+
+
+@pytest.mark.parametrize('failed_part', [1, 2])
+def test_permanent_full_body_rejection_skips_remaining_parts_and_continues(conn, caplog, failed_part):
+    class RejectBody(FakeTg):
+        body_attempts = 0
+
+        def send(self, text, keyboard=None, silent=False):
+            if text.startswith('📄'):
+                self.body_attempts += 1
+                if self.body_attempts == failed_part:
+                    raise TelegramError('https://invalid/SECRET ' + text, status_code=400)
+            return super().send(text, keyboard, silent)
+
+    train_rule(conn, 'onemli')
+    body = 'BODY_PRIVATE_MARKER <&😀𐐷>' * 5000
+    g = FakeGmail('a', [raw_mail('a', 'g900', sender='auto@x.com', subject='Tam konu'),
+                        raw_mail('a', 'g901', sender='other@x.com', subject='Sonraki')], bodies={'g900': body})
+    tg = RejectBody()
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    assert 'incomplete' not in stats and tg.body_attempts == failed_part
+    assert sum(m['text'].startswith('📄') for m in tg.sent) == failed_part - 1
+    assert 'Sonraki' in tg.sent[-2]['text']
+    assert tg.sent[-1]['text'].count('Telegram tam metni reddetti') == 1
+    assert 'a · auto@x.com · Tam konu' in tg.sent[-1]['text']
+    assert db.pending_mails(conn) == [] and db.get_meta(conn, 'tur_incomplete') == '0'
+    assert 'BODY_PRIVATE_MARKER' not in caplog.text + '\n'.join(conn.iterdump()) + tg.sent[-1]['text']
+    assert 'SECRET' not in caplog.text + str(tg.sent)
+    count = len(tg.sent)
+    tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(hours=6))
+    assert len(tg.sent) == count and tg.body_attempts == failed_part
+    assert g.applied == [('g900', 'onemli')] and g.body_fetches == ['g900']
+
+
+@pytest.mark.parametrize('status, card_specific, retry_after, delay', [
+    (503, True, None, 15), (None, True, None, 15),
+    (401, True, None, 61), (403, True, None, 61),
+    (400, False, None, 61), (429, True, 1800, 31),
+])
+@pytest.mark.parametrize('failed_part, ambiguous', [(1, False), (2, False), (2, True)])
+def test_full_body_transient_error_defers_then_drops_body_without_duplicate_card_or_part(
+        conn, caplog, status, card_specific, retry_after, delay, failed_part, ambiguous):
+    class FailBody(FakeTg):
+        body_attempts = 0
+        ready = False
+        fail_warning = False
+
+        def send(self, text, keyboard=None, silent=False):
+            if text.startswith('📄'):
+                self.body_attempts += 1
+                if self.body_attempts == failed_part and not self.ready:
+                    if ambiguous:
+                        super().send(text, keyboard, silent)
+                    raise TelegramError('https://invalid/SECRET ' + text, status_code=status,
+                                        card_specific=card_specific, retry_after=retry_after)
+            if 'Uyarı' in text and self.fail_warning:
+                raise TelegramError('SECRET', status_code=503)
+            return super().send(text, keyboard, silent)
+
+    train_rule(conn, 'onemli')
+    body = 'BODY_PRIVATE_MARKER <&😀𐐷>' * 5000
+    g = FakeGmail('a', [raw_mail('a', 'g900', sender='auto@x.com', subject='Tam konu'),
+                        raw_mail('a', 'g901', sender='other@x.com', subject='Sonraki')], bodies={'g900': body})
+    tg = FailBody()
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON, warnings=['b: izin yok'])
+    assert stats['incomplete'] and db.get_meta(conn, 'tur_incomplete') == '1'
+    assert db.get_meta(conn, 'last_run') is None
+    mail = conn.execute("SELECT * FROM mails WHERE gmail_id='g900'").fetchone()
+    assert mail['sent_at'] == NOON.isoformat() and mail['tg_message_id'] == tg.sent[1]['id']
+    assert [m['gmail_id'] for m in db.pending_mails(conn)] == ['g901']
+    assert tg.body_attempts == failed_part
+    assert sum(m['text'].startswith('📄') for m in tg.sent) == failed_part - 1 + ambiguous
+    saved = '\n'.join(conn.iterdump())
+    assert 'kalan parçalar bırakıldı' in saved
+    assert 'BODY_PRIVATE_MARKER' not in saved + caplog.text
+    assert 'SECRET' not in saved + caplog.text + str(tg.sent)
+    assert 'https://' not in caplog.text
+    count = len(tg.sent)
+    if delay > 15:
+        assert tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=5)) == {'incomplete': True}
+        assert len(tg.sent) == count
+    tg.ready = True
+    # Warning delivery may itself fail: the saved body warning must survive.
+    tg.fail_warning = True
+    assert tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=delay))['incomplete']
+    assert db.pending_mails(conn) == [] and tg.body_attempts == failed_part
+    tg.fail_warning = False
+    later = NOON + timedelta(minutes=delay + 1)
+    assert 'incomplete' not in tur.run_tur(conn, {'a': g}, tg, no_ai, later)
+    assert 'b: izin yok' in tg.sent[-1]['text']
+    assert tg.sent[-1]['text'].count('kalan parçalar bırakıldı') == 1
+    assert 'a · auto@x.com · Tam konu' in tg.sent[-1]['text']
+    assert 'BODY_PRIVATE_MARKER' not in tg.sent[-1]['text'] + caplog.text + '\n'.join(conn.iterdump())
+    assert tg.body_attempts == failed_part and g.body_fetches == ['g900']
+    assert g.applied == [('g900', 'onemli')]
+    assert sum('turu</b>' in m['text'] for m in tg.sent) == 1
+    assert sum('a:cop:' in str(m['keyboard']) for m in tg.sent) == 2
+    assert db.get_meta(conn, 'last_run') == later.isoformat()
+    count = len(tg.sent)
+    tur.run_tur(conn, {'a': g}, tg, no_ai, later + timedelta(minutes=1), force=True)
+    assert len(tg.sent) == count
+
+
+def test_full_body_warning_rejection_logs_only_metadata(conn, caplog):
+    class RejectBodyAndWarning(FakeTg):
+        def send(self, text, keyboard=None, silent=False):
+            if text.startswith('📄') or 'Uyarı' in text:
+                raise TelegramError('SECRET ' + text, status_code=400)
+            return super().send(text, keyboard, silent)
+
+    train_rule(conn, 'onemli')
+    body = 'BODY_PRIVATE_MARKER'
+    g = FakeGmail('a', [raw_mail('a', 'g900', sender='auto@x.com')], bodies={'g900': body})
+    tg = RejectBodyAndWarning()
+    assert 'incomplete' not in tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    assert len(tg.sent) == 3 and 'tur.log' in tg.sent[-1]['text']
+    assert 'Telegram tam metni reddetti' in caplog.text
+    assert body not in caplog.text + '\n'.join(conn.iterdump())
+    assert 'SECRET' not in caplog.text + str(tg.sent)
+
+
+@pytest.mark.parametrize('fallback_rejected', [False, True])
+def test_full_body_waits_for_a_successfully_delivered_card(conn, fallback_rejected):
+    class RejectCard(FakeTg):
+        def send(self, text, keyboard=None, silent=False):
+            if 'a:cop:' in str(keyboard) and ('📬 <i>' in text or fallback_rejected):
+                raise TelegramError('ret', status_code=400)
+            return super().send(text, keyboard, silent)
+
+    train_rule(conn, 'onemli')
+    g = FakeGmail('a', [raw_mail('a', 'g900', sender='auto@x.com')], bodies={'g900': 'Tam içerik'})
+    tg = RejectCard()
+    assert 'incomplete' not in tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    assert g.body_fetches == ([] if fallback_rejected else ['g900'])
+    assert sum(m['text'].startswith('📄') for m in tg.sent) == (not fallback_rejected)
+    if not fallback_rejected:
+        assert 'Telegram ayrıntılı kartı reddetti' in tg.sent[1]['text']
+        assert tg.sent[2]['text'].startswith('📄')
+    assert db.pending_mails(conn) == []
+
+
+def test_auto_important_body_after_resumed_card_does_not_repeat_gmail_action(conn):
+    train_rule(conn, 'onemli')
+    g = FakeGmail('a', [raw_mail('a', 'g900', sender='auto@x.com')], bodies={'g900': 'Tam içerik'})
+    tg = FailingTg(2)
+    assert tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)['incomplete']
+    assert g.body_fetches == []
+    assert 'incomplete' not in tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=15))
+    assert g.body_fetches == ['g900'] and g.applied == [('g900', 'onemli')]
+    assert len(tg.sent) == 4  # summary, card, body, original deferred warning
+    assert tg.sent[2]['text'].startswith('📄') and db.pending_mails(conn) == []

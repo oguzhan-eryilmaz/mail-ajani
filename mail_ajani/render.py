@@ -10,18 +10,54 @@ MAX_AUTOS_LISTED = 20
 MAX_RULES_LISTED = 50
 
 
+def _utf16_units(text: str) -> int:
+    return len(text.encode("utf-16-le")) // 2
+
+
 def _short_html(text: str, budget: int) -> str:
     # Limit the escaped UTF-16 payload too: entities/tags and astral characters
     # cannot take the card beyond Telegram's limit, even before HTML parsing.
     parts, used = [], 0
     for char in text:
         part = escape(char)
-        size = len(part.encode("utf-16-le")) // 2
+        size = _utf16_units(part)
         if used + size > budget - 1:
             return "".join(parts) + "…"
         parts.append(part)
         used += size
     return "".join(parts)
+
+
+def full_body_messages(subject: str, body: str) -> list[str]:
+    if not body:
+        return []
+    head = "📄 Tam metin · " + _short_html(subject or "(konu yok)", 300)
+    suffix = "\n… devamı Gmail'de"
+    # Reserve numbering before splitting; never split an escaped entity or an
+    # astral character. Stop after four parts without escaping the entire body.
+    budget = 4095 - _utf16_units(head + " (4/4)\n")
+    chunks, offset = [], 0
+    for index in range(4):
+        parts, used = [], 0
+        while offset < len(body):
+            part = escape(body[offset])
+            size = _utf16_units(part)
+            if used + size > budget:
+                break
+            parts.append(part)
+            used += size
+            offset += 1
+        if index == 3 and offset < len(body):
+            while used + _utf16_units(suffix) > budget:
+                used -= _utf16_units(parts.pop())
+        chunks.append("".join(parts))
+        if offset == len(body):
+            break
+    if offset < len(body):
+        chunks[-1] += suffix
+    count = len(chunks)
+    return [head + (f" ({i}/{count})" if count > 1 else "") + "\n" + chunk
+            for i, chunk in enumerate(chunks, 1)]
 
 
 def card_text(mail) -> str:

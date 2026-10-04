@@ -202,3 +202,59 @@ def test_bot_setup_explains_telegram_failure_without_traceback_or_token(tmp_path
     out = capsys.readouterr().out
     assert phrase in out and 'SECRET' not in out and 'Traceback' not in out
     assert config.load_config()['chat_id'] is None
+
+
+class _ProfileSvc:
+    def __init__(self, address):
+        self.address = address
+
+    def users(self):
+        return self
+
+    def getProfile(self, userId):
+        return self
+
+    def execute(self, num_retries=0):
+        return {'emailAddress': self.address}
+
+
+def _hesap_ekle_env(tmp_path, monkeypatch, granted):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    (tmp_path / 'client_secret-sirket.com.json').write_text('{}')
+    store = {}
+    monkeypatch.setattr(cli.sirlar, 'set_secret', lambda n, v: store.__setitem__(n, v))
+    monkeypatch.setattr(cli.sirlar, 'get_secret', lambda n: store.get(n))
+    monkeypatch.setattr(cli.sirlar, 'delete_secret', lambda n: store.pop(n, None))
+    monkeypatch.setattr(cli.gmail, 'authorize', lambda email: store.__setitem__(f'gmail:{email}', 'TOKEN'))
+    def build(account):
+        assert f'gmail:{account}' in store
+        c = FakeGmail(account)
+        c.svc = _ProfileSvc(granted)
+        return c
+    monkeypatch.setattr(cli.gmail, 'build_client', build)
+    return store
+
+
+def test_hesap_ekle_saves_the_address_that_actually_granted_access(tmp_path, monkeypatch, capsys):
+    # Canlı kurulum, 5 Ekim: komut yer tutucu adresle çalıştırıldı, hesap yanlış adla kaydoldu.
+    store = _hesap_ekle_env(tmp_path, monkeypatch, 'Gercek@sirket.com')
+    assert cli.cmd_hesap_ekle('ADRESIN@sirket.com') == 0
+    assert config.load_config()['accounts'] == ['gercek@sirket.com']
+    assert store == {'gmail:gercek@sirket.com': 'TOKEN'}
+    out = capsys.readouterr().out
+    assert 'gercek@sirket.com' in out and 'TOKEN' not in out
+
+
+def test_hesap_ekle_matching_address_is_unchanged(tmp_path, monkeypatch):
+    store = _hesap_ekle_env(tmp_path, monkeypatch, 'ben@sirket.com')
+    assert cli.cmd_hesap_ekle('ben@sirket.com') == 0
+    assert config.load_config()['accounts'] == ['ben@sirket.com']
+    assert store == {'gmail:ben@sirket.com': 'TOKEN'}
+
+
+def test_hesap_ekle_refuses_token_from_another_domain(tmp_path, monkeypatch, capsys):
+    (tmp_path / 'client_secret.json').write_text('{}')
+    store = _hesap_ekle_env(tmp_path, monkeypatch, 'kisisel@gmail.com')
+    assert cli.cmd_hesap_ekle('ben@sirket.com') == 1
+    assert config.load_config()['accounts'] == [] and store == {}
+    assert 'hesap-ekle kisisel@gmail.com' in capsys.readouterr().out

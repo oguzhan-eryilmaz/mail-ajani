@@ -147,7 +147,21 @@ def cmd_hesap_ekle(email: str) -> int:
         return 2
     print(f"Tarayıcı açılacak: {email} hesabıyla giriş yapıp izin ver.")
     gmail.authorize(email)
-    gmail.build_client(email).fetch_new(datetime.now(config.TZ))  # connection check
+    client = gmail.build_client(email)
+    actual = client.svc.users().getProfile(userId="me").execute(num_retries=3)["emailAddress"].lower()
+    if actual != email.lower():
+        # The browser login decides the account; never keep a token under another name.
+        if config.client_secret_path(actual) != config.client_secret_path(email):
+            sirlar.delete_secret(f"gmail:{email}")
+            print(f"İzin {actual} hesabıyla verildi ama bu adres başka bir izin dosyası gerektiriyor. "
+                  f"Komutu doğru adresle yeniden çalıştır: hesap-ekle {actual}")
+            return 1
+        sirlar.set_secret(f"gmail:{actual}", sirlar.get_secret(f"gmail:{email}"))
+        sirlar.delete_secret(f"gmail:{email}")
+        print(f"Not: izin {actual} hesabıyla verildi; hesap bu adresle kaydediliyor.")
+        email = actual
+        client = gmail.build_client(email)
+    client.fetch_new(datetime.now(config.TZ))  # connection check
     cfg = config.load_config()
     if email not in cfg["accounts"]:
         cfg["accounts"].append(email)

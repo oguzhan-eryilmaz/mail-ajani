@@ -82,6 +82,9 @@ class GmailClient:
         m = self._messages()
         if action == "cop":
             m.untrash(userId="me", id=gmail_id).execute(num_retries=3)
+            # Live check, 5 Oct 2026: untrash alone leaves the mail archived
+            # (no INBOX label). Every mail the agent handles came from the inbox.
+            m.modify(userId="me", id=gmail_id, body={"addLabelIds": ["INBOX"]}).execute(num_retries=3)
         elif action == "arsiv":
             m.modify(userId="me", id=gmail_id, body={
                 "addLabelIds": ["INBOX"], "removeLabelIds": [self._label_id(LABEL_ARSIV)]}).execute(num_retries=3)

@@ -88,6 +88,8 @@ def test_revert():
     c = GmailClient("a", svc)
     c.revert("m1", "cop")
     msgs.untrash.assert_called_with(userId="me", id="m1")
+    # Canlı deneme, 5 Ekim: untrash maili gelen kutusuna geri koymuyor.
+    assert msgs.modify.call_args.kwargs["body"] == {"addLabelIds": ["INBOX"]}
     c.revert("m1", "arsiv")
     assert msgs.modify.call_args.kwargs["body"] == {"addLabelIds": ["INBOX"], "removeLabelIds": ["LA"]}
     c.revert("m1", "onemli")

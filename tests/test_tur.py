@@ -700,3 +700,17 @@ def test_force_overrides_auth_backoff(conn):
     stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=6), force=True)
     assert 'incomplete' not in stats and db.pending_mails(conn) == []
     assert sum('a:cop:' in str(m['keyboard']) for m in tg.sent) == 1
+
+
+def test_backlog_lookback_widens_window_once_without_duplicates(conn):
+    g = FakeGmail('a', [raw_mail('a', f'g{i}') for i in range(1, 4)])
+    tg = FakeTg()
+    tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    first = len(tg.sent)
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=5), force=True,
+                        lookback=timedelta(days=30))
+    assert g.since == NOON + timedelta(minutes=5) - timedelta(days=30)
+    assert stats['new'] == 0 and len(tg.sent) == first
+    g.mails.append(raw_mail('a', 'g9', subject='eski'))
+    tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=10), force=True, lookback=timedelta(days=30))
+    assert sum('a:cop:' in str(m['keyboard']) for m in tg.sent) == 4

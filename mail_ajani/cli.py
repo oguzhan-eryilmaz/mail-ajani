@@ -2,7 +2,7 @@ import argparse
 import fcntl
 import getpass
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 from logging.handlers import RotatingFileHandler
 
 from . import classifier, config, db, dinleyici, gmail, learning, sirlar, tur
@@ -39,7 +39,10 @@ def _telegram(cfg: dict) -> TelegramClient | None:
     return TelegramClient(token, cfg["chat_id"])
 
 
-def cmd_tur(force: bool) -> int:
+BACKLOG_LIMIT = 200
+
+
+def cmd_tur(force: bool, geri: int | None = None, onayla: bool = False) -> int:
     with (config.home() / "tur.lock").open("a") as lock:
         try:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -49,6 +52,8 @@ def cmd_tur(force: bool) -> int:
         conn = db.connect(config.db_path())
         try:
             now = datetime.now(config.TZ)
+            lookback = timedelta(days=geri) if geri else None
+            force = force or bool(lookback)
             skipped = tur.skip_result(conn, now, force)
             if skipped is not None:
                 log.info("tur: %s", skipped)
@@ -58,8 +63,17 @@ def cmd_tur(force: bool) -> int:
             if tg is None:
                 return 2
             clients, warnings = build_clients(cfg["accounts"])
+            if lookback and not onayla:
+                # Never flood the phone: count first, stop before sending anything.
+                counts = {a: c.count_since(now - lookback, BACKLOG_LIMIT) for a, c in clients.items()}
+                over = {a: n for a, n in counts.items() if n > BACKLOG_LIMIT}
+                if over:
+                    for account in over:
+                        print(f"{account}: son {geri} günde {BACKLOG_LIMIT}'den fazla mail var.")
+                    print("Hiçbir şey gönderilmedi. Daha kısa bir süre seç ya da --onayla ekle.")
+                    return 0
             stats = tur.run_tur(conn, clients, tg, classifier.classify, now, force=force,
-                                warnings=warnings)
+                                warnings=warnings, lookback=lookback)
             log.info("tur: %s", stats)
             return 1 if stats.get("incomplete") else 0
         except Exception as e:
@@ -175,6 +189,8 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="cmd", required=True)
     p_tur = sub.add_parser("tur")
     p_tur.add_argument("--force", action="store_true")
+    p_tur.add_argument("--geri", type=int, metavar="GUN", help="birikmiş mailler için son GUN günü tara")
+    p_tur.add_argument("--onayla", action="store_true", help="--geri sınırını aş")
     sub.add_parser("dinle")
     sub.add_parser("durum")
     sub.add_parser("bot-kur")
@@ -184,7 +200,9 @@ def main(argv: list[str] | None = None) -> int:
 
     _setup_logging(args.cmd)
     if args.cmd == "tur":
-        return cmd_tur(args.force)
+        if args.geri is not None and args.geri < 1:
+            parser.error("--geri en az 1 olmalı")
+        return cmd_tur(args.force, args.geri, args.onayla)
     if args.cmd == "dinle":
         return cmd_dinle()
     if args.cmd == "durum":

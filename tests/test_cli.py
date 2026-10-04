@@ -258,3 +258,25 @@ def test_hesap_ekle_refuses_token_from_another_domain(tmp_path, monkeypatch, cap
     assert cli.cmd_hesap_ekle('ben@sirket.com') == 1
     assert config.load_config()['accounts'] == [] and store == {}
     assert 'hesap-ekle kisisel@gmail.com' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize('count,onayla,runs', [(50, False, True), (201, False, False), (201, True, True)])
+def test_backlog_scan_counts_first_and_never_floods(tmp_path, monkeypatch, capsys, count, onayla, runs):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    monkeypatch.setattr(config, 'load_config', lambda: {'accounts': ['a'], 'chat_id': OWNER})
+    monkeypatch.setattr(cli, '_telegram', lambda cfg: FakeTg())
+    g = FakeGmail('a')
+    g.count_since = lambda since, limit: count
+    monkeypatch.setattr(cli, 'build_clients', lambda accounts: ({'a': g}, []))
+    seen = []
+    def fake_run(conn, clients, tg, classify, now, force=False, warnings=None, lookback=None):
+        seen.append((force, lookback))
+        return {'new': 0}
+    monkeypatch.setattr(cli.tur, 'run_tur', fake_run)
+    assert cli.main(['tur', '--geri', '30'] + (['--onayla'] if onayla else [])) == 0
+    out = capsys.readouterr().out
+    if runs:
+        from datetime import timedelta
+        assert seen == [(True, timedelta(days=30))]
+    else:
+        assert seen == [] and 'Hiçbir şey gönderilmedi' in out

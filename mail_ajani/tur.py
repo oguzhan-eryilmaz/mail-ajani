@@ -28,7 +28,7 @@ def skip_result(conn, now: datetime, force: bool = False) -> dict | None:
 
 
 def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = False,
-            warnings: list[str] | None = None) -> dict:
+            warnings: list[str] | None = None, lookback: timedelta | None = None) -> dict:
     skipped = skip_result(conn, now, force)
     if skipped is not None:
         return skipped
@@ -44,7 +44,9 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
     now_iso = now.isoformat()
 
     for account, client in clients.items():
-        since = schedule.fetch_since(now, _parse(db.get_meta(conn, f"last_fetch:{account}")))
+        # A backlog scan widens the window once; mails already seen are deduplicated.
+        since = (now - lookback if lookback
+                 else schedule.fetch_since(now, _parse(db.get_meta(conn, f"last_fetch:{account}"))))
         try:
             for mail in client.fetch_new(since):
                 db.insert_mail(conn, mail)

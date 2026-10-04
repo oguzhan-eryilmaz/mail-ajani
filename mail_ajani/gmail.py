@@ -67,6 +67,18 @@ class GmailClient:
                         "category": category, "received_at": received.isoformat()})
         return out
 
+    def count_since(self, since: datetime, limit: int) -> int:
+        # Cheap pre-check for backlog scans: ids only, stops just past the limit.
+        query = f"in:inbox after:{int(since.timestamp())}"
+        count, token = 0, None
+        while count <= limit:
+            resp = self._messages().list(userId="me", q=query, pageToken=token, maxResults=100).execute(num_retries=3)
+            count += len(resp.get("messages", []))
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+        return count
+
     def apply(self, gmail_id: str, action: str) -> None:
         m = self._messages()
         if action == "cop":

@@ -6,7 +6,7 @@ from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from . import classifier, config, db, dinleyici, gmail, learning, sirlar, tur
-from .telegram import TelegramClient
+from .telegram import TelegramClient, TelegramError
 
 log = logging.getLogger("mail_ajani")
 
@@ -108,7 +108,19 @@ def cmd_bot_kur() -> int:
     token = getpass.getpass("BotFather'ın verdiği anahtarı yapıştır (ekranda görünmez): ").strip()
     probe = TelegramClient(token, None)
     input("Şimdi telefonda botuna /start yaz, sonra burada Enter'a bas...")
-    updates = probe.updates(0, timeout=0)
+    try:
+        updates = probe.updates(0, timeout=0)
+    except TelegramError as e:
+        code = e.status_code
+        if code in (401, 404):
+            print(f"Telegram bu anahtarı tanımadı (kod {code}). Anahtar eksik ya da fazla karakterle "
+                  "yapıştırılmış olabilir. BotFather'daki anahtarı baştan sona kopyalayıp komutu yeniden çalıştır.")
+        elif code == 409:
+            print("Bu bot şu an başka bir yerden dinleniyor (kod 409). Dinleyici çalışıyorsa durdurup yeniden dene.")
+        else:
+            print(f"Telegram'a ulaşılamadı ({'kod ' + str(code) if code else 'bağlantı hatası'}). "
+                  "İnternet bağlantısını kontrol edip yeniden dene.")
+        return 1
     chats = [u["message"]["chat"] for u in updates
              if u.get("message", {}).get("text", "").strip() == "/start"]
     if not chats:

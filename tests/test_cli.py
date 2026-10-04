@@ -184,3 +184,21 @@ def test_tur_preflight_allows_due_or_pending_work(tmp_path, monkeypatch, work):
     monkeypatch.setattr(cli.tur, 'run_tur', lambda *a, **kw: (calls.append('run'), {})[1])
     assert cli.cmd_tur(force=(work == 'force')) == 0
     assert calls == ['telegram', 'gmail', 'run']
+
+
+@pytest.mark.parametrize('code,phrase', [(401, 'tanımadı'), (404, 'tanımadı'), (409, 'başka bir yerden'),
+                                         (None, 'bağlantı hatası'), (502, 'kod 502')])
+def test_bot_setup_explains_telegram_failure_without_traceback_or_token(tmp_path, monkeypatch, capsys, code, phrase):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    monkeypatch.setattr(cli.getpass, 'getpass', lambda prompt: 'SECRET')
+    monkeypatch.setattr(builtins, 'input', lambda prompt: '')
+    probe = FakeTg()
+    def fail(*a, **kw):
+        raise TelegramError('getUpdates: Telegram isteği başarısız', status_code=code)
+    probe.updates = fail
+    monkeypatch.setattr(cli, 'TelegramClient', lambda *a, **kw: probe)
+    monkeypatch.setattr(cli.sirlar, 'set_secret', lambda *a: pytest.fail('must not save token'))
+    assert cli.cmd_bot_kur() == 1
+    out = capsys.readouterr().out
+    assert phrase in out and 'SECRET' not in out and 'Traceback' not in out
+    assert config.load_config()['chat_id'] is None

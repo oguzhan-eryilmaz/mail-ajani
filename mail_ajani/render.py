@@ -62,8 +62,17 @@ def summary_text(slot_label: str, new_count: int, important_count: int, waiting_
         for i, a in enumerate(autos, 1):
             m = a["mail"]
             lines.append(f"{i}. {ACTION_DONE[a['action']]} ({SOURCE_TEXT[a['source']]}) · "
-                         f"{escape(m['sender'])} · {escape((m['subject'] or '')[:60])}")
+                         f"{_short_html(m['sender'] or '', 70)} · {_short_html(m['subject'] or '', 60)}")
     return "\n".join(lines)
+
+
+def summary_fallback_text(slot_label: str, new_count: int, important_count: int, waiting_count: int,
+                          auto_count: int) -> str:
+    text = (f"<b>{escape(slot_label)} turu</b> · {new_count} yeni · {important_count} önemli · "
+            f"{waiting_count} senin kararını bekliyor")
+    if auto_count:
+        text += f"\n\nKendi yaptıklarım: {auto_count} işlem (ayrıntı gösterilemedi, geri al düğmeleri aşağıda)"
+    return text
 
 
 def summary_keyboard(autos: list) -> dict | None:

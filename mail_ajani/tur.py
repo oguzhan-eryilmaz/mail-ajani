@@ -22,7 +22,7 @@ def skip_result(conn, now: datetime, force: bool = False) -> dict | None:
             and not json.loads(db.get_meta(conn, "pending_warnings") or "[]")):
         return {"skipped": True}
     retry_at = _parse(db.get_meta(conn, "telegram_retry_at"))
-    if retry_at and now < retry_at:
+    if not force and retry_at and now < retry_at:
         return {"incomplete": True}
     return None
 
@@ -128,9 +128,11 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
         backoff = None
         if error.retry_after:
             backoff = timedelta(seconds=monotonic() - started + error.retry_after)
-        elif getattr(error, "needs_backoff", False):
-            # Auth/chat-level failure: retrying every interval would only burn
-            # Gmail and classifier calls until the owner fixes the bot.
+        elif (type(getattr(error, "status_code", None)) is int
+              and 400 <= error.status_code < 500 and error.status_code != 429):
+            # Auth/chat-level failure, or a rejection no fallback could get
+            # around: retrying every interval would only burn Gmail and
+            # classifier calls until the owner looks at it.
             backoff = AUTH_BACKOFF
         if backoff:
             deadline = now + backoff
@@ -150,8 +152,15 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
             batches = (render.summary_batches(autos) if autos
                        or db.get_meta(conn, "tur_summary_sent") != "1" else [])
             for batch in batches:
-                send(render.summary_text(slot_label, len(pending), important, len(cards), batch),
-                     render.summary_keyboard(batch))
+                try:
+                    send(render.summary_text(slot_label, len(pending), important, len(cards), batch),
+                         render.summary_keyboard(batch))
+                except TelegramError as e:
+                    if not e.permanent:
+                        raise
+                    # A rejected summary must not hold back the cards behind it.
+                    send(render.summary_fallback_text(slot_label, len(pending), important, len(cards),
+                                                      len(batch)), render.summary_keyboard(batch))
                 db.set_meta(conn, "tur_summary_sent", "1")
                 for auto in batch:
                     db.mark_notified(conn, auto["decision_id"], now_iso)

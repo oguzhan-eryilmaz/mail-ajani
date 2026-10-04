@@ -634,3 +634,69 @@ def test_rejected_warning_falls_back_once_and_closes_slot(conn, caplog):
     assert 'b: izin yok' in caplog.text
     tur.run_tur(conn, {}, tg, no_ai, NOON + timedelta(minutes=15))
     assert len(tg.sent) == 1
+
+
+def _rule(conn, sender, action='arsiv'):
+    for i in range(10):
+        mid = make_mail(conn, sender=sender)
+        db.mark_sent(conn, mid, None, ts(1))
+        learning.record_user_decision(conn, mid, action, ts(100 + i))
+
+
+def test_summary_with_very_long_senders_stays_under_limit(conn):
+    # Denetim tur 4, Ö4-3: 254 karakterlik adreslerle özet 4096 sınırını aşıyordu.
+    class LengthCheckingTg(FakeTg):
+        def send(self, text, keyboard=None, silent=False):
+            if len(text.encode('utf-16-le')) // 2 > 4096:
+                raise TelegramError('çok uzun', status_code=400)
+            return super().send(text, keyboard, silent)
+
+    senders = [('u%02d' % i) + 'x' * 240 + '@ornek.com' for i in range(20)]
+    for s in senders:
+        _rule(conn, s)
+    g = FakeGmail('a', [raw_mail('a', f'g9{i:02d}', sender=s, subject='k' * 300) for i, s in enumerate(senders)])
+    tg = LengthCheckingTg()
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    assert 'incomplete' not in stats and stats['auto'] == 20
+    assert 'Kendi yaptıklarım' in tg.sent[0]['text'] and 'u00' in tg.sent[0]['text']
+    assert len(g.applied) == 20
+
+
+def test_rejected_summary_falls_back_and_cards_still_arrive(conn):
+    class RejectSummary(FakeTg):
+        def send(self, text, keyboard=None, silent=False):
+            if 'Kendi yaptıklarım:\n' in text:
+                raise TelegramError('kalıcı ret', status_code=400)
+            return super().send(text, keyboard, silent)
+
+    _rule(conn, 'kural@x.com')
+    g = FakeGmail('a', [raw_mail('a', 'g901', sender='kural@x.com'), raw_mail('a', 'g902', sender='yeni@x.com')])
+    tg = RejectSummary()
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    assert 'incomplete' not in stats and db.pending_mails(conn) == []
+    assert 'ayrıntı gösterilemedi' in tg.sent[0]['text'] and 'u:' in str(tg.sent[0]['keyboard'])
+    assert sum('a:cop:' in str(m['keyboard']) for m in tg.sent) == 1
+    assert len(g.applied) == 1
+    count = len(tg.sent)
+    tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=15))
+    assert len(tg.sent) == count and len(g.applied) == 1
+
+
+def test_force_overrides_auth_backoff(conn):
+    # Denetim tur 4, Ö4-1: bot düzeltildikten sonra elle çalıştırma bir saat beklemez.
+    class Forbidden(FakeTg):
+        down = True
+
+        def send(self, text, keyboard=None, silent=False):
+            if self.down:
+                raise TelegramError('yetki yok', status_code=403)
+            return super().send(text, keyboard, silent)
+
+    tg = Forbidden()
+    g = FakeGmail('a', [raw_mail('a', 'g1')])
+    assert tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)['incomplete']
+    tg.down = False
+    assert tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=5)) == {'incomplete': True}
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=6), force=True)
+    assert 'incomplete' not in stats and db.pending_mails(conn) == []
+    assert sum('a:cop:' in str(m['keyboard']) for m in tg.sent) == 1

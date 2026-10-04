@@ -1,0 +1,115 @@
+import json
+from datetime import datetime
+from email.utils import parseaddr
+from html import unescape
+
+from . import config, sirlar
+
+SCOPES = ["https://www.googleapis.com/auth/gmail.modify"]
+LABEL_ARSIV = "Ajan/Arşiv"
+LABEL_ONEMLI = "Ajan/Önemli"
+CATEGORIES = {"CATEGORY_PROMOTIONS": "tanitim", "CATEGORY_SOCIAL": "sosyal",
+              "CATEGORY_UPDATES": "guncelleme", "CATEGORY_FORUMS": "forum"}
+
+
+class GmailAuthError(Exception):
+    pass
+
+
+class GmailClient:
+    def __init__(self, account: str, service):
+        self.account = account
+        self.svc = service
+        self._labels: dict[str, str] = {}
+
+    def _messages(self):
+        return self.svc.users().messages()
+
+    def _label_id(self, name: str) -> str:
+        if name not in self._labels:
+            existing = self.svc.users().labels().list(userId="me").execute().get("labels", [])
+            for label in existing:
+                self._labels[label["name"]] = label["id"]
+        if name not in self._labels:
+            created = self.svc.users().labels().create(userId="me", body={
+                "name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute()
+            self._labels[name] = created["id"]
+        return self._labels[name]
+
+    def fetch_new(self, since: datetime) -> list[dict]:
+        query = f"in:inbox after:{int(since.timestamp())}"
+        ids, token = [], None
+        while True:
+            resp = self._messages().list(userId="me", q=query, pageToken=token, maxResults=100).execute()
+            ids += [m["id"] for m in resp.get("messages", [])]
+            token = resp.get("nextPageToken")
+            if not token:
+                break
+        out = []
+        for mid in ids:
+            msg = self._messages().get(userId="me", id=mid, format="metadata",
+                                       metadataHeaders=["From", "Subject"]).execute()
+            headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
+            name, addr = parseaddr(headers.get("from", ""))
+            labels = msg.get("labelIds", [])
+            category = next((v for k, v in CATEGORIES.items() if k in labels), "birincil")
+            received = datetime.fromtimestamp(int(msg["internalDate"]) / 1000, config.TZ)
+            out.append({"account": self.account, "gmail_id": mid, "sender": addr.lower(), "sender_name": name,
+                        "subject": headers.get("subject", ""), "snippet": unescape(msg.get("snippet", "")),
+                        "category": category, "received_at": received.isoformat()})
+        return out
+
+    def apply(self, gmail_id: str, action: str) -> None:
+        m = self._messages()
+        if action == "cop":
+            m.trash(userId="me", id=gmail_id).execute()
+        elif action == "arsiv":
+            m.modify(userId="me", id=gmail_id, body={
+                "removeLabelIds": ["INBOX"], "addLabelIds": [self._label_id(LABEL_ARSIV)]}).execute()
+        elif action == "onemli":
+            m.modify(userId="me", id=gmail_id, body={
+                "addLabelIds": ["STARRED", self._label_id(LABEL_ONEMLI)]}).execute()
+
+    def revert(self, gmail_id: str, action: str) -> None:
+        m = self._messages()
+        if action == "cop":
+            m.untrash(userId="me", id=gmail_id).execute()
+        elif action == "arsiv":
+            m.modify(userId="me", id=gmail_id, body={
+                "addLabelIds": ["INBOX"], "removeLabelIds": [self._label_id(LABEL_ARSIV)]}).execute()
+        elif action == "onemli":
+            m.modify(userId="me", id=gmail_id, body={
+                "removeLabelIds": ["STARRED", self._label_id(LABEL_ONEMLI)]}).execute()
+
+
+def load_credentials(account: str):
+    from google.auth.exceptions import RefreshError
+    from google.auth.transport.requests import Request
+    from google.oauth2.credentials import Credentials
+
+    raw = sirlar.get_secret(f"gmail:{account}")
+    if not raw:
+        raise GmailAuthError(f"{account} için izin yok")
+    creds = Credentials.from_authorized_user_info(json.loads(raw), SCOPES)
+    if not creds.valid:
+        try:
+            creds.refresh(Request())
+        except RefreshError as e:
+            raise GmailAuthError(f"{account} izni geçersiz, yeniden izin gerekli") from e
+        sirlar.set_secret(f"gmail:{account}", creds.to_json())
+    return creds
+
+
+def build_client(account: str) -> GmailClient:
+    from googleapiclient.discovery import build
+
+    service = build("gmail", "v1", credentials=load_credentials(account), cache_discovery=False)
+    return GmailClient(account, service)
+
+
+def authorize(account: str) -> None:
+    from google_auth_oauthlib.flow import InstalledAppFlow
+
+    flow = InstalledAppFlow.from_client_secrets_file(str(config.client_secret_path(account)), SCOPES)
+    creds = flow.run_local_server(port=0, login_hint=account, prompt="consent", access_type="offline")
+    sirlar.set_secret(f"gmail:{account}", creds.to_json())

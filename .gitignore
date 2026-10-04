@@ -1,0 +1,10 @@
+.DS_Store
+.venv/
+__pycache__/
+.pytest_cache/
+*.db
+*.db-wal
+*.db-shm
+client_secret*.json
+token*.json
+config.json

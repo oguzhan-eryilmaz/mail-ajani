@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mail-ajani"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+  "google-api-python-client>=2.150",
+  "google-auth-oauthlib>=1.2",
+  "keyring>=25",
+  "requests>=2.32",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[project.scripts]
+mail-ajani = "mail_ajani.cli:main"
+
+[tool.setuptools]
+packages = ["mail_ajani"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]

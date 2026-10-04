@@ -8,16 +8,26 @@ MAX_RETRY_WAIT_S = 60
 
 
 class TelegramError(Exception):
-    def __init__(self, message, *, retry_after=None, not_modified=False, status_code=None):
+    def __init__(self, message, *, retry_after=None, not_modified=False, status_code=None,
+                 card_specific=True):
         super().__init__(message)
         self.retry_after = retry_after
         self.not_modified = not_modified
         self.status_code = status_code
+        self.card_specific = card_specific
 
     @property
     def permanent(self):
+        # Only Telegram's own 400 about this message means "this card is bad".
+        # Auth, chat-level and proxy errors (401/403/404/407, non-JSON bodies)
+        # say nothing about the card and must be retried later, not recorded
+        # as a rejection.
+        return type(self.status_code) is int and self.status_code == 400 and self.card_specific
+
+    @property
+    def needs_backoff(self):
         return (type(self.status_code) is int and 400 <= self.status_code < 500
-                and self.status_code != 429)
+                and self.status_code != 429 and not self.permanent)
 
 
 class TelegramClient:
@@ -49,7 +59,7 @@ class TelegramClient:
                     if "message is not modified" in description:
                         error = TelegramError(f"{method}: mesaj zaten aynı", not_modified=True)
                     elif "chat not found" in description:
-                        error = TelegramError(f"{method}: sohbet bulunamadı")
+                        error = TelegramError(f"{method}: sohbet bulunamadı", card_specific=False)
                     else:
                         error = TelegramError(f"{method}: Telegram isteği başarısız")
                     if code == 429:
@@ -65,7 +75,8 @@ class TelegramClient:
                 error = TelegramError(f"{method}: bağlantı hatası ({e.__class__.__name__})")
                 delay = 2 ** attempt
             except (requests.RequestException, ValueError, KeyError) as e:
-                error = TelegramError(f"{method}: bağlantı hatası ({e.__class__.__name__})", status_code=status)
+                error = TelegramError(f"{method}: bağlantı hatası ({e.__class__.__name__})", status_code=status,
+                                      card_specific=False)
             if delay is None or attempt == MAX_RETRIES or waited + delay > MAX_RETRY_WAIT_S:
                 raise error from None
             sleep(delay)

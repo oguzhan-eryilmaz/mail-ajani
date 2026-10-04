@@ -8,6 +8,7 @@ from .telegram import TelegramError
 
 log = logging.getLogger(__name__)
 SEND_INTERVAL_S = 1.0
+AUTH_BACKOFF = timedelta(hours=1)
 
 
 def _parse(value: str | None) -> datetime | None:
@@ -105,11 +106,12 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
     sent_any = False
     # Permanent fallback rejections are durable and identified in the warning.
     # Their mails become delivered only after that warning reaches the owner.
-    rejected_ids = []
+    rejected = {}
 
-    def rejection_warning(mid):
-        return (f"Mail #{mid}: kısa kart da reddedildi. "
-                "Mail yerelde kayıtlı; Gmail'den kontrol edin.")
+    def rejection_warning(mail):
+        subject = (mail["subject"] or "(konu yok)")[:80]
+        return (f"Mail #{mail['id']} ({mail['account']} · {(mail['sender'] or '')[:80]} · {subject}): "
+                "kısa kart da reddedildi. Mail yerelde kayıtlı; Gmail'den kontrol edin.")
 
     def send(text, keyboard=None):
         nonlocal sent_any
@@ -123,9 +125,15 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
         nonlocal complete
         log.warning("Telegram gönderimi tamamlanamadı (%s)", error.__class__.__name__)
         warnings.append("Telegram gönderimi tamamlanamadı; kalan bildirimler yeniden denenecek.")
+        backoff = None
         if error.retry_after:
-            retry_delay = monotonic() - started + error.retry_after
-            deadline = now + timedelta(seconds=retry_delay)
+            backoff = timedelta(seconds=monotonic() - started + error.retry_after)
+        elif getattr(error, "needs_backoff", False):
+            # Auth/chat-level failure: retrying every interval would only burn
+            # Gmail and classifier calls until the owner fixes the bot.
+            backoff = AUTH_BACKOFF
+        if backoff:
+            deadline = now + backoff
             previous = _parse(db.get_meta(conn, "telegram_retry_at"))
             db.set_meta(conn, "telegram_retry_at", max(deadline, previous or deadline).isoformat())
         complete = False
@@ -151,8 +159,8 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
                         db.mark_sent(conn, auto["mail"]["id"], None, now_iso)
             for mail in cards:
                 if str(mail["id"]) in rejections:
-                    rejected_ids.append(mail["id"])
-                    warnings.append(rejection_warning(mail["id"]))
+                    rejected[mail["id"]] = rejection_warning(mail)
+                    warnings.append(rejected[mail["id"]])
                     continue
                 keyboard = render.card_keyboard(mail["id"])
                 try:
@@ -169,18 +177,27 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
                             continue
                         rejections[str(mail["id"])] = fallback_error.status_code
                         db.set_meta(conn, "card_rejections", json.dumps(rejections))
-                        rejected_ids.append(mail["id"])
-                        warnings.append(rejection_warning(mail["id"]))
+                        rejected[mail["id"]] = rejection_warning(mail)
+                        warnings.append(rejected[mail["id"]])
                         continue
                 db.mark_sent(conn, mail["id"], message_id, now_iso)
         warnings = [w for w in dict.fromkeys(warnings) if w not in warned]
         if warnings:
             db.set_meta(conn, "pending_warnings", json.dumps(warnings, ensure_ascii=False))
-            send(render.warnings_text(warnings))
-            warned += warnings
-            db.set_meta(conn, "tur_warned", json.dumps(warned, ensure_ascii=False))
-        for mid in rejected_ids:
-            if rejection_warning(mid) in warned:
+            for text, items in render.warning_messages(warnings):
+                try:
+                    send(text)
+                except TelegramError as e:
+                    if not e.permanent:
+                        raise
+                    # Telegram refused the warning text itself: keep the detail
+                    # in the log and tell the owner where to look, once.
+                    log.warning("Uyarı mesajı reddedildi, içerik: %s", items)
+                    send(render.warnings_fallback_text(len(items)))
+                warned += items
+                db.set_meta(conn, "tur_warned", json.dumps(warned, ensure_ascii=False))
+        for mid, text in rejected.items():
+            if text in warned:
                 db.mark_sent(conn, mid, None, now_iso)
     except TelegramError as e:
         defer(e)

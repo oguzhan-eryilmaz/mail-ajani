@@ -80,3 +80,13 @@ def test_truncation_preserves_html_entities_tags_and_utf16_budget():
         parser = CardParser()
         parser.feed(text)
         assert parser.tags == []
+
+
+def test_warning_messages_split_and_escape():
+    from mail_ajani import render
+    msgs = render.warning_messages(["<x>" + "y" * 5000] + [f"u{i}" * 200 for i in range(30)])
+    assert len(msgs) > 1
+    assert all(len(t.encode("utf-16-le")) // 2 <= 4096 for t, _ in msgs)
+    assert sum(len(items) for _, items in msgs) == 31
+    assert "&lt;x&gt;" in msgs[0][0] and "…" in msgs[0][0]
+    assert render.warning_messages([]) == []

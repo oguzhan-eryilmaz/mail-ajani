@@ -120,12 +120,20 @@ def test_error_exposes_safe_permanent_status_without_server_text(code):
     with pytest.raises(TelegramError) as exc:
         TelegramClient('SECRET', 1, session=session).send('x')
     assert exc.value.status_code == code
-    assert exc.value.permanent == (400 <= code < 500 and code != 429)
-    assert len(session.calls) == (1 if exc.value.permanent else 4)
+    assert exc.value.permanent == (code == 400)
+    assert exc.value.needs_backoff == (code in (401, 403, 404, 422))
+    assert len(session.calls) == (1 if 400 <= code < 500 and code != 429 else 4)
     assert 'SECRET' not in str(exc.value) and 'https://' not in str(exc.value)
 
 
-def test_non_json_http_rejection_is_permanent_and_safe():
+def test_chat_not_found_is_not_a_card_rejection():
+    session = FakeSession({'ok': False, 'error_code': 400, 'description': 'Bad Request: chat not found'})
+    with pytest.raises(TelegramError) as exc:
+        TelegramClient('SECRET', 1, session=session).send('x')
+    assert not exc.value.permanent and exc.value.needs_backoff
+
+
+def test_non_json_http_rejection_is_not_a_card_rejection_and_safe():
     class NonJsonResponse:
         status_code = 400
         def json(self):
@@ -135,5 +143,6 @@ def test_non_json_http_rejection_is_permanent_and_safe():
             return NonJsonResponse()
     with pytest.raises(TelegramError) as exc:
         TelegramClient('SECRET', 1, session=Session()).send('x')
-    assert exc.value.permanent and exc.value.status_code == 400
+    assert not exc.value.permanent and exc.value.status_code == 400
+    assert exc.value.needs_backoff
     assert 'SECRET' not in str(exc.value) and 'https://' not in str(exc.value)

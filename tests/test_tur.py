@@ -557,3 +557,80 @@ def test_recorded_rejection_reconstructs_identified_warning_before_marking_sent(
     assert len(tg.sent) == 1 and f'Mail #{mid}' in tg.sent[0]['text']
     assert 'kısa kart da reddedildi' in tg.sent[0]['text']
     assert db.get_mail(conn, mid)['sent_at'] == NOON.isoformat()
+
+
+def test_auth_failure_is_not_recorded_as_card_rejection_and_recovers_with_buttons(conn):
+    # Denetim tur 3, Ö-A: 403 kart reddi değildir; kartlar düğmeleriyle sonradan gelmeli.
+    class Forbidden(FakeTg):
+        down = True
+
+        def send(self, text, keyboard=None, silent=False):
+            if self.down:
+                raise TelegramError('yetki yok', status_code=403)
+            return super().send(text, keyboard, silent)
+
+    tg = Forbidden()
+    g = FakeGmail('a', [raw_mail('a', f'g{i}') for i in range(1, 4)])
+    assert tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)['incomplete']
+    assert not db.get_meta(conn, 'card_rejections')
+    assert len(db.pending_mails(conn)) == 3
+    # Yetki hatasında bir saat beklenir: 15 dakika sonraki çağrı hiçbir şey yapmaz.
+    g.since = 'dokunulmadı'
+    assert tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=15)) == {'incomplete': True}
+    assert g.since == 'dokunulmadı'
+    tg.down = False
+    stats = tur.run_tur(conn, {'a': g}, tg, no_ai, NOON + timedelta(minutes=61))
+    assert 'incomplete' not in stats and db.pending_mails(conn) == []
+    cards = [m for m in tg.sent if 'a:cop:' in str(m['keyboard'])]
+    assert len(cards) == 3 and g.applied == []
+    assert not any('kısa kart da reddedildi' in m['text'] for m in tg.sent)
+
+
+def test_rejection_warning_names_account_sender_and_subject(conn):
+    # Denetim tur 3, Ö-B.
+    class RejectCard(FakeTg):
+        def send(self, text, keyboard=None, silent=False):
+            if 'a:cop:1' in str(keyboard):
+                raise TelegramError('kalıcı ret', status_code=400)
+            return super().send(text, keyboard, silent)
+
+    tg = RejectCard()
+    g = FakeGmail('a', [raw_mail('a', 'g1', sender='banka@ornek.com', subject='Ekstre <Ekim>')])
+    assert 'incomplete' not in tur.run_tur(conn, {'a': g}, tg, no_ai, NOON)
+    text = tg.sent[-1]['text']
+    assert 'Mail #1' in text and 'banka@ornek.com' in text and 'Ekstre &lt;Ekim&gt;' in text
+    assert db.pending_mails(conn) == []
+
+
+def test_many_warnings_are_split_under_telegram_limit(conn):
+    class LengthCheckingTg(FakeTg):
+        def send(self, text, keyboard=None, silent=False):
+            if len(text.encode('utf-16-le')) // 2 > 4096:
+                raise TelegramError('çok uzun', status_code=400)
+            return super().send(text, keyboard, silent)
+
+    tg = LengthCheckingTg()
+    many = [f'hesap{i}: ' + 'x' * 300 for i in range(40)]
+    stats = tur.run_tur(conn, {}, tg, no_ai, NOON, warnings=many)
+    assert 'incomplete' not in stats
+    assert len(tg.sent) > 1 and all('Uyarı' in m['text'] for m in tg.sent)
+    assert all(f'hesap{i}:' in ''.join(m['text'] for m in tg.sent) for i in range(40))
+    count = len(tg.sent)
+    tur.run_tur(conn, {}, tg, no_ai, NOON + timedelta(minutes=15))
+    assert len(tg.sent) == count
+
+
+def test_rejected_warning_falls_back_once_and_closes_slot(conn, caplog):
+    class RejectWarning(FakeTg):
+        def send(self, text, keyboard=None, silent=False):
+            if '<b>Uyarı</b>' in text:
+                raise TelegramError('kalıcı ret', status_code=400)
+            return super().send(text, keyboard, silent)
+
+    tg = RejectWarning()
+    stats = tur.run_tur(conn, {}, tg, no_ai, NOON, warnings=['b: izin yok'])
+    assert 'incomplete' not in stats
+    assert len(tg.sent) == 1 and 'tur.log' in tg.sent[0]['text']
+    assert 'b: izin yok' in caplog.text
+    tur.run_tur(conn, {}, tg, no_ai, NOON + timedelta(minutes=15))
+    assert len(tg.sent) == 1

@@ -100,6 +100,33 @@ def warnings_text(warnings: list[str]) -> str:
     return "⚠️ <b>Uyarı</b>\n" + "\n".join(f"• {escape(w)}" for w in warnings)
 
 
+MAX_WARNING_UNITS = 3800
+MAX_WARNING_LINE_UNITS = 700
+
+
+def warning_messages(warnings: list[str]) -> list[tuple[str, list[str]]]:
+    # Telegram rejects messages over 4096 UTF-16 units; split long warning
+    # lists and return which warnings each message carries.
+    head = "⚠️ <b>Uyarı</b>"
+    out, lines, items, used = [], [], [], 0
+    for w in warnings:
+        line = "• " + _short_html(w, MAX_WARNING_LINE_UNITS)
+        size = len(line.encode("utf-16-le")) // 2 + 1
+        if lines and used + size > MAX_WARNING_UNITS:
+            out.append((head + "\n" + "\n".join(lines), items))
+            lines, items, used = [], [], 0
+        lines.append(line)
+        items.append(w)
+        used += size
+    if lines:
+        out.append((head + "\n" + "\n".join(lines), items))
+    return out
+
+
+def warnings_fallback_text(count: int) -> str:
+    return f"⚠️ {count} uyarı Telegram'a gönderilemedi; ayrıntı tur.log dosyasında."
+
+
 def status_text(last_run: str | None, pending_count: int, rule_count: int, authorities: set[str]) -> str:
     auth = ", ".join(PREDICTION_TEXT[a] for a in sorted(authorities)) or "yok"
     return (f"<b>Durum</b>\nSon tur: {escape(last_run or 'henüz yok')}\n"

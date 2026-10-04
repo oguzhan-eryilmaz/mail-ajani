@@ -1,4 +1,5 @@
 import argparse
+import fcntl
 import getpass
 import logging
 from datetime import datetime
@@ -14,6 +15,8 @@ def _setup_logging(name: str) -> None:
     handler = RotatingFileHandler(config.log_dir() / f"{name}.log", maxBytes=1_000_000, backupCount=3)
     handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
     logging.basicConfig(level=logging.INFO, handlers=[handler, logging.StreamHandler()])
+    # googleapiclient's retry warnings include the request URL; our own warnings are safe.
+    logging.getLogger("googleapiclient.http").setLevel(logging.CRITICAL)
 
 
 def build_clients(accounts: list[str], builder=gmail.build_client) -> tuple[dict, list[str]]:
@@ -37,16 +40,33 @@ def _telegram(cfg: dict) -> TelegramClient | None:
 
 
 def cmd_tur(force: bool) -> int:
-    cfg = config.load_config()
-    tg = _telegram(cfg)
-    if tg is None:
-        return 2
-    conn = db.connect(config.db_path())
-    clients, warnings = build_clients(cfg["accounts"])
-    stats = tur.run_tur(conn, clients, tg, classifier.classify, datetime.now(config.TZ), force=force,
-                        warnings=warnings)
-    log.info("tur: %s", stats)
-    return 0
+    with (config.home() / "tur.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Başka bir tur çalışıyor; bu tur atlandı.")
+            return 0
+        conn = db.connect(config.db_path())
+        try:
+            now = datetime.now(config.TZ)
+            skipped = tur.skip_result(conn, now, force)
+            if skipped is not None:
+                log.info("tur: %s", skipped)
+                return 1 if skipped.get("incomplete") else 0
+            cfg = config.load_config()
+            tg = _telegram(cfg)
+            if tg is None:
+                return 2
+            clients, warnings = build_clients(cfg["accounts"])
+            stats = tur.run_tur(conn, clients, tg, classifier.classify, now, force=force,
+                                warnings=warnings)
+            log.info("tur: %s", stats)
+            return 1 if stats.get("incomplete") else 0
+        except Exception as e:
+            log.warning("Tur tamamlanamadı (%s); yeniden denenecek.", e.__class__.__name__)
+            return 1
+        finally:
+            conn.close()
 
 
 def cmd_dinle() -> int:
@@ -58,7 +78,11 @@ def cmd_dinle() -> int:
     cache: dict = {}
 
     def get_clients() -> dict:
-        missing = [a for a in cfg["accounts"] if a not in cache]
+        accounts = config.load_config()["accounts"]
+        for account in list(cache):
+            if account not in accounts:
+                cache.pop(account)
+        missing = [a for a in accounts if a not in cache]
         if missing:
             built, _ = build_clients(missing)
             cache.update(built)
@@ -85,13 +109,20 @@ def cmd_bot_kur() -> int:
     probe = TelegramClient(token, None)
     input("Şimdi telefonda botuna /start yaz, sonra burada Enter'a bas...")
     updates = probe.updates(0, timeout=0)
-    chats = [u["message"]["chat"]["id"] for u in updates if "message" in u]
+    chats = [u["message"]["chat"] for u in updates
+             if u.get("message", {}).get("text", "").strip() == "/start"]
     if not chats:
         print("Mesaj bulunamadı. Bota /start yazdığından emin ol ve tekrar dene.")
         return 1
+    chat = chats[-1]
+    name = chat.get("title") or " ".join(filter(None, [chat.get("first_name"), chat.get("last_name")]))
+    print(f"Bulunan sohbet: {name or '(ad yok)'} · @{chat.get('username') or '(kullanıcı adı yok)'} · kimlik: {chat['id']}")
+    if input("Bu sohbeti sahip olarak kaydetmek için evet yaz: ").strip().lower() != "evet":
+        print("Onay verilmedi; Telegram kurulumu kaydedilmedi.")
+        return 1
     sirlar.set_secret("telegram_token", token)
     cfg = config.load_config()
-    cfg["chat_id"] = chats[-1]
+    cfg["chat_id"] = chat["id"]
     config.save_config(cfg)
     TelegramClient(token, cfg["chat_id"]).send("✅ Mail Ajanı bağlandı. Bundan sonra mailler buraya gelecek.")
     print("Tamam: Telegram bağlandı, telefonuna deneme mesajı gitti.")

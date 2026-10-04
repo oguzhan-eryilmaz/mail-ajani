@@ -110,3 +110,18 @@ def test_recent_examples(conn):
     decide(conn, "e@x.com", "cop", 0)
     ex = learning.recent_examples(conn)
     assert ex == [{"sender": "e@x.com", "subject": "Konu", "action": "cop"}]
+
+
+def test_empty_sender_does_not_form_rule_and_never_uses_style_authority(conn):
+    for i in range(10):
+        decide(conn, '', 'cop', i)
+    assert learning.list_rules(conn) == []
+    assert learning.rule_for(conn, '') is None
+    assert learning.auto_action(conn, '', 'cop', {'cop'}) is None
+    # A stale rule from an old database must not bypass the barrier.
+    conn.execute("INSERT INTO rules(sender, action, created_at) VALUES('', 'arsiv', ?)", (ts(1),))
+    conn.commit()
+    assert learning.rule_for(conn, '') is None
+    assert learning.auto_action(conn, '', 'onemli', {'onemli'}) is None
+    learning.update_rule_for_sender(conn, '', ts(2000))
+    assert learning.list_rules(conn) == []

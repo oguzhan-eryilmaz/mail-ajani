@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS decisions(
   action TEXT NOT NULL,
   source TEXT NOT NULL,
   created_at TEXT NOT NULL,
+  notified_at TEXT,
   undone INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS rules(
@@ -44,6 +45,11 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(SCHEMA)
+    # The listener can also open a legacy DB while a scheduled run migrates it.
+    conn.execute("BEGIN IMMEDIATE")
+    if "notified_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}:
+        conn.execute("ALTER TABLE decisions ADD COLUMN notified_at TEXT")
+    conn.commit()
     return conn
 
 
@@ -62,10 +68,16 @@ def get_mail(conn, mail_id: int):
 def pending_mails(conn) -> list:
     return conn.execute(
         "SELECT * FROM mails m WHERE sent_at IS NULL AND NOT EXISTS "
-        "(SELECT 1 FROM decisions d WHERE d.mail_id=m.id AND d.undone=0) ORDER BY received_at, id").fetchall()
+        "(SELECT 1 FROM decisions d WHERE d.mail_id=m.id AND d.undone=0 AND d.source='user') "
+        "ORDER BY received_at, id").fetchall()
 
 
-def set_prediction(conn, mail_id: int, prediction: str, summary: str | None) -> None:
+def mark_notified(conn, decision_id: int, now_iso: str) -> None:
+    conn.execute("UPDATE decisions SET notified_at=? WHERE id=?", (now_iso, decision_id))
+    conn.commit()
+
+
+def set_prediction(conn, mail_id: int, prediction: str | None, summary: str | None) -> None:
     conn.execute("UPDATE mails SET prediction=?, summary=? WHERE id=?", (prediction, summary, mail_id))
     conn.commit()
 

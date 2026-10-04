@@ -10,15 +10,35 @@ MAX_AUTOS_LISTED = 20
 MAX_RULES_LISTED = 50
 
 
+def _short_html(text: str, budget: int) -> str:
+    # Limit the escaped UTF-16 payload too: entities/tags and astral characters
+    # cannot take the card beyond Telegram's limit, even before HTML parsing.
+    parts, used = [], 0
+    for char in text:
+        part = escape(char)
+        size = len(part.encode("utf-16-le")) // 2
+        if used + size > budget - 1:
+            return "".join(parts) + "…"
+        parts.append(part)
+        used += size
+    return "".join(parts)
+
+
 def card_text(mail) -> str:
     name = mail["sender_name"] or mail["sender"]
     body = mail["summary"] or mail["snippet"] or ""
     prediction = PREDICTION_TEXT.get(mail["prediction"], "tahmin yok")
-    return (f"📬 <i>{escape(mail['account'])}</i>\n"
-            f"👤 <b>{escape(name)}</b> &lt;{escape(mail['sender'])}&gt;\n"
-            f"📝 {escape(mail['subject'] or '(konu yok)')}\n\n"
-            f"{escape(body)}\n\n"
+    return (f"📬 <i>{_short_html(mail['account'], 250)}</i>\n"
+            f"👤 <b>{_short_html(name, 400)}</b> &lt;{_short_html(mail['sender'], 350)}&gt;\n"
+            f"📝 {_short_html(mail['subject'] or '(konu yok)', 1800)}\n\n"
+            f"{_short_html(body, 1000)}\n\n"
             f"🤖 Tahmin: {prediction}")
+
+
+def fallback_card_text(mail) -> str:
+    return (f"📬 Mail #{mail['id']} · {_short_html(mail['account'], 100)}\n"
+            "Telegram ayrıntılı kartı reddetti. Mail Gmail'de kayıtlıdır.\n"
+            f"📝 {_short_html(mail['subject'] or '(konu yok)', 200)}")
 
 
 def card_keyboard(mail_id: int) -> dict:
@@ -39,12 +59,10 @@ def summary_text(slot_label: str, new_count: int, important_count: int, waiting_
              f"{waiting_count} senin kararını bekliyor"]
     if autos:
         lines.append("\nKendi yaptıklarım:")
-        for i, a in enumerate(autos[:MAX_AUTOS_LISTED], 1):
+        for i, a in enumerate(autos, 1):
             m = a["mail"]
             lines.append(f"{i}. {ACTION_DONE[a['action']]} ({SOURCE_TEXT[a['source']]}) · "
                          f"{escape(m['sender'])} · {escape((m['subject'] or '')[:60])}")
-        if len(autos) > MAX_AUTOS_LISTED:
-            lines.append(f"… ve {len(autos) - MAX_AUTOS_LISTED} tane daha")
     return "\n".join(lines)
 
 
@@ -52,8 +70,12 @@ def summary_keyboard(autos: list) -> dict | None:
     if not autos:
         return None
     buttons = [{"text": f"↩ {i}", "callback_data": f"u:{a['decision_id']}"}
-               for i, a in enumerate(autos[:MAX_AUTOS_LISTED], 1)]
+               for i, a in enumerate(autos, 1)]
     return {"inline_keyboard": [buttons[i:i + 5] for i in range(0, len(buttons), 5)]}
+
+
+def summary_batches(autos: list) -> list[list]:
+    return [autos[i:i + MAX_AUTOS_LISTED] for i in range(0, len(autos), MAX_AUTOS_LISTED)] or [[]]
 
 
 def rules_text(rules, authorities: set[str]) -> str:

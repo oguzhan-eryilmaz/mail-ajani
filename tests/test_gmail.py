@@ -1,3 +1,11 @@
+import logging
+
+import pytest
+from googleapiclient.http import HttpRequest
+from googleapiclient.errors import HttpError
+from httplib2 import Response
+from mail_ajani import cli
+
 from datetime import datetime
 from unittest.mock import MagicMock
 
@@ -84,3 +92,46 @@ def test_revert():
     assert msgs.modify.call_args.kwargs["body"] == {"addLabelIds": ["INBOX"], "removeLabelIds": ["LA"]}
     c.revert("m1", "onemli")
     assert msgs.modify.call_args.kwargs["body"] == {"removeLabelIds": ["STARRED", "LO"]}
+
+
+def test_every_gmail_request_has_bounded_library_retries():
+    svc, msgs, lab = service_with([raw('m1')])
+    client = GmailClient('a', svc)
+    client.fetch_new(datetime(2026, 9, 19, tzinfo=TZ))
+    for action in ('cop', 'arsiv', 'onemli'):
+        client.apply('m1', action)
+        client.revert('m1', action)
+    # Includes message list/get, label list/create, trash/untrash and all modify calls.
+    calls = [call for call in svc.mock_calls if str(call[0]).endswith('.execute')]
+    assert len(calls) >= 10
+    assert all(call.kwargs == {'num_retries': 3} for call in calls)
+    msgs.delete.assert_not_called()
+    for call in msgs.modify.call_args_list:
+        assert 'UNREAD' not in str(call.kwargs)
+
+
+@pytest.mark.parametrize('statuses, succeeds', [([429, 503, 200], True), ([503] * 4, False)])
+def test_library_retries_transient_gmail_errors_without_url_logs(monkeypatch, caplog, statuses, succeeds):
+    logger = logging.getLogger('googleapiclient.http')
+    monkeypatch.setattr(logger, 'level', logger.level)
+    cli._setup_logging('gmail-retry-test')
+    statuses = iter(statuses)
+    transport = MagicMock()
+    transport.request.side_effect = lambda *a, **kw: (Response({'status': next(statuses)}), b'{}')
+    request = HttpRequest(transport, lambda resp, data: {},
+                          uri='https://example.invalid/private-url', method='POST')
+    sleeps = []
+    request._sleep = sleeps.append
+    request._rand = lambda: 0.5
+    svc, msgs, _ = service_with([])
+    msgs.trash.return_value = request
+    client = GmailClient('a', svc)
+    if succeeds:
+        client.apply('m1', 'cop')
+        assert transport.request.call_count == 3 and sleeps == [1, 2]
+    else:
+        with pytest.raises(HttpError):
+            client.apply('m1', 'cop')
+        assert transport.request.call_count == 4 and sleeps == [1, 2, 4]
+    assert 'private-url' not in caplog.text and 'https://' not in caplog.text
+    msgs.delete.assert_not_called()

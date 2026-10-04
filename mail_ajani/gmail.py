@@ -16,6 +16,14 @@ class GmailAuthError(Exception):
     pass
 
 
+def is_auth_error(error: Exception) -> bool:
+    from google.auth.exceptions import RefreshError
+    from googleapiclient.errors import HttpError
+
+    return (isinstance(error, (GmailAuthError, RefreshError)) or
+            isinstance(error, HttpError) and error.resp.status == 401)
+
+
 class GmailClient:
     def __init__(self, account: str, service):
         self.account = account
@@ -27,12 +35,12 @@ class GmailClient:
 
     def _label_id(self, name: str) -> str:
         if name not in self._labels:
-            existing = self.svc.users().labels().list(userId="me").execute().get("labels", [])
+            existing = self.svc.users().labels().list(userId="me").execute(num_retries=3).get("labels", [])
             for label in existing:
                 self._labels[label["name"]] = label["id"]
         if name not in self._labels:
             created = self.svc.users().labels().create(userId="me", body={
-                "name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute()
+                "name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute(num_retries=3)
             self._labels[name] = created["id"]
         return self._labels[name]
 
@@ -40,7 +48,7 @@ class GmailClient:
         query = f"in:inbox after:{int(since.timestamp())}"
         ids, token = [], None
         while True:
-            resp = self._messages().list(userId="me", q=query, pageToken=token, maxResults=100).execute()
+            resp = self._messages().list(userId="me", q=query, pageToken=token, maxResults=100).execute(num_retries=3)
             ids += [m["id"] for m in resp.get("messages", [])]
             token = resp.get("nextPageToken")
             if not token:
@@ -48,7 +56,7 @@ class GmailClient:
         out = []
         for mid in ids:
             msg = self._messages().get(userId="me", id=mid, format="metadata",
-                                       metadataHeaders=["From", "Subject"]).execute()
+                                       metadataHeaders=["From", "Subject"]).execute(num_retries=3)
             headers = {h["name"].lower(): h["value"] for h in msg.get("payload", {}).get("headers", [])}
             name, addr = parseaddr(headers.get("from", ""))
             labels = msg.get("labelIds", [])
@@ -62,24 +70,24 @@ class GmailClient:
     def apply(self, gmail_id: str, action: str) -> None:
         m = self._messages()
         if action == "cop":
-            m.trash(userId="me", id=gmail_id).execute()
+            m.trash(userId="me", id=gmail_id).execute(num_retries=3)
         elif action == "arsiv":
             m.modify(userId="me", id=gmail_id, body={
-                "removeLabelIds": ["INBOX"], "addLabelIds": [self._label_id(LABEL_ARSIV)]}).execute()
+                "removeLabelIds": ["INBOX"], "addLabelIds": [self._label_id(LABEL_ARSIV)]}).execute(num_retries=3)
         elif action == "onemli":
             m.modify(userId="me", id=gmail_id, body={
-                "addLabelIds": ["STARRED", self._label_id(LABEL_ONEMLI)]}).execute()
+                "addLabelIds": ["STARRED", self._label_id(LABEL_ONEMLI)]}).execute(num_retries=3)
 
     def revert(self, gmail_id: str, action: str) -> None:
         m = self._messages()
         if action == "cop":
-            m.untrash(userId="me", id=gmail_id).execute()
+            m.untrash(userId="me", id=gmail_id).execute(num_retries=3)
         elif action == "arsiv":
             m.modify(userId="me", id=gmail_id, body={
-                "addLabelIds": ["INBOX"], "removeLabelIds": [self._label_id(LABEL_ARSIV)]}).execute()
+                "addLabelIds": ["INBOX"], "removeLabelIds": [self._label_id(LABEL_ARSIV)]}).execute(num_retries=3)
         elif action == "onemli":
             m.modify(userId="me", id=gmail_id, body={
-                "removeLabelIds": ["STARRED", self._label_id(LABEL_ONEMLI)]}).execute()
+                "removeLabelIds": ["STARRED", self._label_id(LABEL_ONEMLI)]}).execute(num_retries=3)
 
 
 def load_credentials(account: str):

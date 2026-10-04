@@ -18,6 +18,10 @@ def _blocked(conn, sender: str, action: str) -> bool:
 
 
 def update_rule_for_sender(conn, sender: str, now_iso: str) -> None:
+    if not sender.strip():
+        conn.execute("DELETE FROM rules WHERE sender=?", (sender,))
+        conn.commit()
+        return
     since = db.get_meta(conn, f"rule_reset:{sender}") or ""
     acts = [r["action"] for r in conn.execute(
         "SELECT d.action FROM decisions d JOIN mails m ON m.id=d.mail_id "
@@ -40,6 +44,8 @@ def record_user_decision(conn, mail_id: int, action: str, now_iso: str) -> int:
 
 
 def rule_for(conn, sender: str) -> str | None:
+    if not sender.strip():
+        return None
     row = conn.execute("SELECT action FROM rules WHERE sender=?", (sender,)).fetchone()
     if row is None or _blocked(conn, sender, row["action"]):
         return None
@@ -60,6 +66,8 @@ def style_authorities(conn) -> set[str]:
 
 
 def auto_action(conn, sender: str, prediction: str | None, authorities: set[str]) -> tuple[str, str] | None:
+    if not sender.strip():
+        return None
     action = rule_for(conn, sender)
     if action:
         return action, "rule"

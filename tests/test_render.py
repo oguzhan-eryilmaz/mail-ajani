@@ -33,10 +33,13 @@ def test_summary_lists_autos_with_undo():
     t = render.summary_text("12:00", 30, 2, 8, autos)
     assert t.startswith("<b>12:00 turu</b> · 30 yeni · 2 önemli · 8 senin kararını bekliyor")
     assert "1. 🗑 Çöpe atıldı (kural)" in t
-    assert "2 tane daha" in t
+    assert "22. 🗑 Çöpe atıldı (kural)" in t and "tane daha" not in t
     kb = render.summary_keyboard(autos)
     flat = [b["callback_data"] for row in kb["inline_keyboard"] for b in row]
-    assert flat[0] == "u:10" and len(flat) == 20
+    assert flat == [f"u:{10 + i}" for i in range(22)]
+    batches = render.summary_batches(autos)
+    assert [len(batch) for batch in batches] == [20, 2]
+    assert [a for batch in batches for a in batch] == autos
 
 
 def test_summary_without_autos():
@@ -56,3 +59,24 @@ def test_rules():
 
 def test_warnings_escape():
     assert "&lt;x&gt;" in render.warnings_text(["<x>"])
+
+
+def test_truncation_preserves_html_entities_tags_and_utf16_budget():
+    from html.parser import HTMLParser
+    class CardParser(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.tags = []
+        def handle_starttag(self, tag, attrs):
+            assert tag in ('b', 'i') and attrs == []
+            self.tags.append(tag)
+        def handle_endtag(self, tag):
+            assert self.tags.pop() == tag
+    long = '😀<&>"' * 5000
+    mail = {**MAIL, **{key: long for key in ('account', 'sender', 'sender_name', 'subject', 'summary')}}
+    for text in (render.card_text(mail), render.done_text(mail, 'onemli'), render.fallback_card_text(mail)):
+        assert len(text.encode('utf-16-le')) // 2 < 4096
+        assert '…' in text and '&amp;' in text and '&lt;' in text
+        parser = CardParser()
+        parser.feed(text)
+        assert parser.tags == []

@@ -1,3 +1,14 @@
+import builtins
+import fcntl
+
+import pytest
+
+from mail_ajani import config, db
+from mail_ajani.gmail import GmailAuthError
+from mail_ajani.telegram import TelegramError
+from tests.helpers import FakeGmail, FakeTg, make_mail
+from tests.test_dinleyici import cb, OWNER, NOW
+
 from mail_ajani import cli
 
 
@@ -18,3 +29,158 @@ def test_tur_requires_setup(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cli.sirlar, "get_secret", lambda name: None)
     assert cli.main(["tur"]) == 2
     assert "bot-kur" in capsys.readouterr().out
+
+
+def test_overlapping_forced_tur_exits_cleanly_before_loading_config(tmp_path, monkeypatch, capsys):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    def forbidden():
+        raise AssertionError('second tur must not reach config or services')
+    monkeypatch.setattr(config, 'load_config', forbidden)
+    with (tmp_path / 'tur.lock').open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert cli.cmd_tur(force=True) == 0
+    assert 'Başka bir tur çalışıyor' in capsys.readouterr().out
+
+
+def test_lock_spans_whole_run_and_is_released_after_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    monkeypatch.setattr(config, 'load_config', lambda: {'accounts': [], 'chat_id': OWNER})
+    monkeypatch.setattr(cli, '_telegram', lambda cfg: FakeTg())
+    calls = []
+    def running(*args, **kwargs):
+        calls.append(1)
+        assert cli.cmd_tur(force=True) == 0  # independent open cannot acquire flock
+        raise TelegramError('SECRET')
+    monkeypatch.setattr(cli.tur, 'run_tur', running)
+    assert cli.cmd_tur(force=False) == 1
+    assert cli.cmd_tur(force=True) == 1  # lock was released even on exception
+    assert len(calls) == 2
+
+
+def test_cmd_tur_returns_retry_status_when_work_incomplete(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    monkeypatch.setattr(config, 'load_config', lambda: {'accounts': [], 'chat_id': OWNER})
+    monkeypatch.setattr(cli, '_telegram', lambda cfg: FakeTg())
+    monkeypatch.setattr(cli.tur, 'run_tur', lambda *a, **kw: {'incomplete': True})
+    assert cli.cmd_tur(force=False) == 1
+
+
+def test_listener_reloads_accounts_and_rebuilds_client_after_auth_failure(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    config.save_config({'accounts': ['a'], 'chat_id': OWNER})
+    tg = FakeTg()
+    monkeypatch.setattr(cli, '_telegram', lambda cfg: tg)
+    a1, a2, b = FakeGmail('a'), FakeGmail('a'), FakeGmail('b')
+    def denied(gid, action):
+        raise GmailAuthError('invalid token')
+    a1.apply = denied
+    builds = []
+    def build(accounts):
+        builds.append(accounts[:])
+        if accounts == ['a']:
+            return {'a': a1 if builds.count(['a']) == 1 else a2}, []
+        assert accounts == ['b']
+        return {'b': b}, []
+    monkeypatch.setattr(cli, 'build_clients', build)
+    def listener(conn, get_clients, tg, owner):
+        first = get_clients()
+        assert first == {'a': a1}
+        config.save_config({'accounts': ['a', 'b'], 'chat_id': OWNER})
+        assert get_clients() == {'a': a1, 'b': b}
+        mid = make_mail(conn, account='b')
+        cli.dinleyici.handle_update(conn, cb(f'a:cop:{mid}'), get_clients(), tg, owner, NOW)
+        assert len(b.applied) == 1
+        mid = make_mail(conn, account='a')
+        cli.dinleyici.handle_update(conn, cb(f'a:cop:{mid}'), get_clients(), tg, owner, NOW)
+        assert db.active_decision(conn, mid) is None
+        cli.dinleyici.handle_update(conn, cb(f'a:cop:{mid}'), get_clients(), tg, owner, NOW)
+        assert db.active_decision(conn, mid)['action'] == 'cop' and len(a2.applied) == 1
+        config.save_config({'accounts': ['b'], 'chat_id': OWNER})
+        assert get_clients() == {'b': b}
+    monkeypatch.setattr(cli.dinleyici, 'run_listener', listener)
+    assert cli.cmd_dinle() == 0
+    assert builds == [['a'], ['b'], ['a']]
+
+
+@pytest.mark.parametrize('confirmation', ['', 'hayır', 'yes', 'evet'])
+def test_bot_setup_shows_start_chat_and_requires_explicit_confirmation(tmp_path, monkeypatch, capsys, confirmation):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    monkeypatch.setattr(cli.getpass, 'getpass', lambda prompt: 'SECRET')
+    inputs = iter(['', confirmation])
+    monkeypatch.setattr(builtins, 'input', lambda prompt: next(inputs))
+    updates = [
+        {'message': {'text': '/start', 'chat': {'id': OWNER, 'first_name': 'Sahip', 'username': 'sahip'}}},
+        {'message': {'text': 'merhaba', 'chat': {'id': 999, 'first_name': 'Başka'}}},
+    ]
+    probe = FakeTg()
+    probe.updates = lambda *a, **kw: updates
+    monkeypatch.setattr(cli, 'TelegramClient', lambda *a, **kw: probe)
+    saved = []
+    monkeypatch.setattr(cli.sirlar, 'set_secret', lambda *args: saved.append(args))
+    result = cli.cmd_bot_kur()
+    output = capsys.readouterr().out
+    assert 'Sahip' in output and '@sahip' in output and str(OWNER) in output
+    assert 'SECRET' not in output
+    if confirmation == 'evet':
+        assert result == 0 and config.load_config()['chat_id'] == OWNER
+        assert saved == [('telegram_token', 'SECRET')] and len(probe.sent) == 1
+    else:
+        assert result == 1 and config.load_config()['chat_id'] is None
+        assert not (tmp_path / 'config.json').exists()
+        assert saved == [] and probe.sent == []
+
+
+def test_bot_setup_ignores_non_start_messages(tmp_path, monkeypatch):
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    monkeypatch.setattr(cli.getpass, 'getpass', lambda prompt: 'SECRET')
+    monkeypatch.setattr(builtins, 'input', lambda prompt: '')
+    probe = FakeTg()
+    probe.updates = lambda *a, **kw: [{'message': {'text': 'hi', 'chat': {'id': 999}}}]
+    monkeypatch.setattr(cli, 'TelegramClient', lambda *a, **kw: probe)
+    monkeypatch.setattr(cli.sirlar, 'set_secret', lambda *a: pytest.fail('must not save token'))
+    assert cli.cmd_bot_kur() == 1
+    assert config.load_config()['chat_id'] is None and probe.sent == []
+
+
+@pytest.mark.parametrize('deferred', [False, True])
+def test_tur_skips_before_keychain_or_gmail_client_build(tmp_path, monkeypatch, deferred):
+    from datetime import datetime, timedelta
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    now = datetime.now(config.TZ)
+    conn = db.connect(config.db_path())
+    if deferred:
+        db.set_meta(conn, 'tur_incomplete', '1')
+        db.set_meta(conn, 'telegram_retry_at', (now + timedelta(hours=1)).isoformat())
+    else:
+        db.set_meta(conn, 'last_run', now.isoformat())
+    conn.close()
+    def forbidden(*a, **kw):
+        pytest.fail('skipped tur must not read secrets or build/refresh clients')
+    monkeypatch.setattr(cli.sirlar, 'get_secret', forbidden)
+    monkeypatch.setattr(cli, '_telegram', forbidden)
+    monkeypatch.setattr(cli, 'build_clients', forbidden)
+    monkeypatch.setattr(config, 'load_config', forbidden)
+    assert cli.cmd_tur(force=False) == (1 if deferred else 0)
+
+
+@pytest.mark.parametrize('work', ['force', 'pending', 'warning', 'incomplete', 'new_slot'])
+def test_tur_preflight_allows_due_or_pending_work(tmp_path, monkeypatch, work):
+    from datetime import datetime, timedelta
+    monkeypatch.setenv('MAIL_AJANI_HOME', str(tmp_path))
+    now = datetime.now(config.TZ)
+    conn = db.connect(config.db_path())
+    db.set_meta(conn, 'last_run', (now - timedelta(hours=6) if work == 'new_slot' else now).isoformat())
+    if work == 'pending':
+        make_mail(conn)
+    elif work == 'warning':
+        db.set_meta(conn, 'pending_warnings', '["uyarı"]')
+    elif work == 'incomplete':
+        db.set_meta(conn, 'tur_incomplete', '1')
+    conn.close()
+    calls = []
+    monkeypatch.setattr(config, 'load_config', lambda: {'accounts': ['a'], 'chat_id': OWNER})
+    monkeypatch.setattr(cli, '_telegram', lambda cfg: (calls.append('telegram'), FakeTg())[1])
+    monkeypatch.setattr(cli, 'build_clients', lambda accounts: (calls.append('gmail'), ({}, []))[1])
+    monkeypatch.setattr(cli.tur, 'run_tur', lambda *a, **kw: (calls.append('run'), {})[1])
+    assert cli.cmd_tur(force=(work == 'force')) == 0
+    assert calls == ['telegram', 'gmail', 'run']

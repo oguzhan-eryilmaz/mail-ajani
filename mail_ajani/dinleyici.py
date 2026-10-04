@@ -2,7 +2,7 @@ import logging
 import time
 from datetime import datetime
 
-from . import db, learning, render
+from . import db, gmail, learning, render
 from .config import TZ
 
 log = logging.getLogger(__name__)
@@ -28,8 +28,10 @@ def _on_action(conn, cq, action, mail_id, clients, tg, now_iso):
             client.revert(mail["gmail_id"], active["action"])
             learning.undo(conn, active["id"], now_iso)
         client.apply(mail["gmail_id"], action)
-    except Exception:
-        log.exception("gmail action failed")
+    except Exception as e:
+        if gmail.is_auth_error(e):
+            clients.pop(mail["account"], None)
+        log.warning("Gmail işlemi başarısız (%s)", e.__class__.__name__)
         tg.answer(cq["id"], "Gmail'e ulaşılamadı, tekrar dene")
         return
     decision_id = learning.record_user_decision(conn, mail_id, action, now_iso)
@@ -49,13 +51,15 @@ def _on_undo(conn, cq, decision_id, clients, tg, now_iso):
         return
     try:
         client.revert(mail["gmail_id"], decision["action"])
-    except Exception:
-        log.exception("gmail revert failed")
+    except Exception as e:
+        if gmail.is_auth_error(e):
+            clients.pop(mail["account"], None)
+        log.warning("Gmail geri alma başarısız (%s)", e.__class__.__name__)
         tg.answer(cq["id"], "Gmail'e ulaşılamadı, tekrar dene")
         return
     learning.undo(conn, decision_id, now_iso)
     mail = db.get_mail(conn, mail["id"])
-    if cq["message"]["message_id"] == mail["tg_message_id"]:
+    if mail["tg_message_id"] is not None:
         tg.edit(mail["tg_message_id"], render.card_text(mail), render.card_keyboard(mail["id"]))
     else:
         message_id = tg.send(render.card_text(mail), render.card_keyboard(mail["id"]))

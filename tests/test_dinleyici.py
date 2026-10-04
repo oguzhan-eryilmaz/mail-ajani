@@ -1,3 +1,9 @@
+import pytest
+from google.auth.exceptions import RefreshError
+from googleapiclient.errors import HttpError
+from httplib2 import Response
+from mail_ajani.gmail import GmailAuthError
+
 from datetime import datetime
 
 from mail_ajani import db, dinleyici, learning
@@ -121,3 +127,46 @@ def test_run_listener_persists_offset(conn):
     tg = Tg()
     dinleyici.run_listener(conn, lambda: {}, tg, OWNER, stop=lambda: tg.calls >= 2)
     assert db.get_meta(conn, "tg_offset") == "11"
+
+
+def test_undo_auto_important_from_summary_edits_existing_card_without_sending(conn):
+    mid, g, tg = setup(conn)
+    did = db.add_decision(conn, mid, 'onemli', 'rule', ts(2))
+    dinleyici.handle_update(conn, cb(f'u:{did}', message_id=777), {'a': g}, tg, OWNER, NOW)
+    assert tg.sent == []
+    assert tg.edited[-1]['id'] == 500
+    assert 'a:cop:' in str(tg.edited[-1]['keyboard'])
+    assert db.get_mail(conn, mid)['tg_message_id'] == 500
+    assert db.active_decision(conn, mid) is None
+    assert g.reverted == [(db.get_mail(conn, mid)['gmail_id'], 'onemli')]
+
+
+@pytest.mark.parametrize('error', [
+    GmailAuthError('SECRET'), RefreshError('SECRET'), HttpError(Response({'status': 401}), b'SECRET'),
+])
+@pytest.mark.parametrize('undo', [False, True])
+def test_auth_failure_invalidates_cached_client_for_action_and_undo(conn, error, undo, caplog):
+    mid, g, tg = setup(conn)
+    def denied(gid, action):
+        raise error
+    g.apply = g.revert = denied
+    clients = {'a': g}
+    if undo:
+        did = db.add_decision(conn, mid, 'cop', 'rule', ts(2))
+        update = cb(f'u:{did}')
+    else:
+        update = cb(f'a:cop:{mid}')
+    dinleyici.handle_update(conn, update, clients, tg, OWNER, NOW)
+    assert clients == {}
+    assert 'tekrar dene' in tg.answered[-1]
+    assert 'SECRET' not in caplog.text + str(tg.answered)
+
+
+def test_transient_gmail_error_keeps_cached_client(conn):
+    mid, g, tg = setup(conn)
+    def unavailable(gid, action):
+        raise HttpError(Response({'status': 503}), b'temporary')
+    g.apply = unavailable
+    clients = {'a': g}
+    dinleyici.handle_update(conn, cb(f'a:cop:{mid}'), clients, tg, OWNER, NOW)
+    assert clients == {'a': g} and db.active_decision(conn, mid) is None

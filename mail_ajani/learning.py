@@ -94,7 +94,7 @@ def undo(conn, decision_id: int, now_iso: str):
         _reset_rule(conn, sender, now_iso)
     elif decision["source"] == "style":
         reset_authority(conn, decision["action"], now_iso)
-    else:
+    elif decision["source"] == "user":
         update_rule_for_sender(conn, sender, now_iso)
     return decision
 

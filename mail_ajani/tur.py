@@ -3,7 +3,7 @@ import logging
 from datetime import datetime, timedelta
 from time import monotonic, sleep
 
-from . import db, learning, render, schedule
+from . import config, db, learning, render, schedule
 from .telegram import TelegramError
 
 log = logging.getLogger(__name__)
@@ -56,20 +56,43 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
             warnings.append(f"{account}: mailler alınamadı ({e.__class__.__name__})")
 
     pending = db.pending_mails(conn)
+    categories = {c["ad"]: c for c in config.get_categories()}
     active = {m["id"]: db.active_decision(conn, m["id"]) for m in pending}
-    to_classify = [m for m in pending if active[m["id"]] is None
-                   and str(m["id"]) not in rejections
-                   and learning.rule_for(conn, m["sender"]) is None]
+    to_classify = [m for m in pending if
+                   (not m["content_category"] if categories else
+                    active[m["id"]] is None and str(m["id"]) not in rejections
+                    and learning.rule_for(conn, m["sender"]) is None)]
     predictions = {}
     if to_classify:
         try:
-            predictions, errors = classify_fn(to_classify, learning.recent_examples(conn))
+            kwargs = {"kategoriler": list(categories.values())} if categories else {}
+            predictions, errors = classify_fn(to_classify, learning.recent_examples(conn), **kwargs)
         except Exception as e:
             predictions, errors = {}, [f"sınıflandırıcı çalışmadı ({e.__class__.__name__})"]
         warnings += [f"Sınıflandırma yapılamadı, bazı mailler tahminsiz geldi: {e}" for e in errors]
         # A previous failed send may have left a prediction; fallback must clear it.
         for mail in to_classify:
             db.set_prediction(conn, mail["id"], *predictions.get(mail["id"], (None, None)))
+            name = getattr(predictions, "categories", {}).get(mail["id"], "")
+            if categories and not mail["content_category"]:
+                if isinstance(name, str) and name in categories and mail["id"] in predictions:
+                    db.set_category(conn, mail["id"], name)
+                    client = clients.get(mail["account"])
+                    if client:
+                        try:
+                            client.label_category(mail["gmail_id"], name, categories[name].get("renk"))
+                        except Exception as e:
+                            # Retain the card fallback across a Telegram outage too.
+                            db.set_meta(conn, f"category_label_failed:{mail['id']}", "1")
+                            log.warning("Kategori etiketi uygulanamadı: mail #%s (%s)",
+                                        mail["id"], e.__class__.__name__)
+                            warnings.append(f"Mail #{mail['id']} ({mail['account']}): kategori etiketi "
+                                            f"uygulanamadı ({e.__class__.__name__}); kategori yerelde kayıtlı.")
+                else:
+                    warnings.append(f"Mail #{mail['id']}: geçerli kategori alınamadı; otomatik işlem yapılmadı.")
+
+    # Category writes above must be visible to priority checks and cards.
+    pending = [db.get_mail(conn, m["id"]) for m in pending]
 
     authorities = learning.style_authorities(conn)
     autos, card_ids = [], []
@@ -79,9 +102,22 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
             continue
         decision = active[mail["id"]]
         if decision is None:
-            automatic = learning.auto_action(conn, mail["sender"],
-                                             predictions.get(mail["id"], (None,))[0], authorities)
+            category = categories.get(mail["content_category"])
+            if category and category["onemli"]:
+                automatic = None if db.category_undone(conn, mail["id"]) else ("onemli", "kategori")
+            elif categories and category is None:
+                # Never apply rule/style blindly when category assessment failed.
+                automatic = None
+            elif categories and db.get_meta(conn, f"category_label_failed:{mail['id']}") == "1":
+                # A failed label must not hide the mail behind a destructive auto.
+                automatic = None
+            else:
+                automatic = learning.auto_action(conn, mail["sender"],
+                                                 predictions.get(mail["id"], (None,))[0], authorities)
             client = clients.get(mail["account"])
+            if automatic and not client and categories:
+                warnings.append(f"Mail #{mail['id']} ({mail['account']}): hesap şu an bağlı değil; "
+                                "otomatik işlem uygulanamadı.")
             if automatic and client:
                 action, source = automatic
                 try:
@@ -199,7 +235,7 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
                 db.mark_sent(conn, mail["id"], message_id, now_iso)
                 decision = active[mail["id"]]
                 if (decision and decision["action"] == "onemli"
-                        and decision["source"] in {"rule", "style"}):
+                        and decision["source"] in {"rule", "style", "kategori"}):
                     try:
                         body = clients[mail["account"]].fetch_body(mail["gmail_id"])
                     except Exception:

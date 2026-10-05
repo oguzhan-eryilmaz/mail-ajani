@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS mails(
   subject TEXT,
   snippet TEXT,
   category TEXT,
+  content_category TEXT,
   received_at TEXT,
   prediction TEXT,
   summary TEXT,
@@ -49,6 +50,8 @@ def connect(path: str | Path) -> sqlite3.Connection:
     conn.execute("BEGIN IMMEDIATE")
     if "notified_at" not in {r["name"] for r in conn.execute("PRAGMA table_info(decisions)")}:
         conn.execute("ALTER TABLE decisions ADD COLUMN notified_at TEXT")
+    if "content_category" not in {r["name"] for r in conn.execute("PRAGMA table_info(mails)")}:
+        conn.execute("ALTER TABLE mails ADD COLUMN content_category TEXT")
     conn.commit()
     return conn
 
@@ -82,6 +85,16 @@ def set_prediction(conn, mail_id: int, prediction: str | None, summary: str | No
     conn.commit()
 
 
+def set_category(conn, mail_id: int, name: str) -> None:
+    conn.execute("UPDATE mails SET content_category=? WHERE id=?", (name, mail_id))
+    conn.commit()
+
+
+def uncategorized_mails(conn) -> list:
+    return conn.execute("SELECT * FROM mails WHERE content_category IS NULL OR content_category='' "
+                        "ORDER BY received_at, id").fetchall()
+
+
 def mark_sent(conn, mail_id: int, tg_message_id: int | None, now_iso: str) -> None:
     conn.execute("UPDATE mails SET sent_at=?, tg_message_id=? WHERE id=?", (now_iso, tg_message_id, mail_id))
     conn.commit()
@@ -101,6 +114,11 @@ def get_decision(conn, decision_id: int):
 def active_decision(conn, mail_id: int):
     return conn.execute("SELECT * FROM decisions WHERE mail_id=? AND undone=0 ORDER BY id DESC LIMIT 1",
                         (mail_id,)).fetchone()
+
+
+def category_undone(conn, mail_id: int) -> bool:
+    return conn.execute("SELECT 1 FROM decisions WHERE mail_id=? AND source='kategori' AND undone=1 LIMIT 1",
+                        (mail_id,)).fetchone() is not None
 
 
 def mark_undone(conn, decision_id: int) -> None:

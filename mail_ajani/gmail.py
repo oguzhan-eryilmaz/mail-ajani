@@ -103,16 +103,31 @@ class GmailClient:
     def _messages(self):
         return self.svc.users().messages()
 
-    def _label_id(self, name: str) -> str:
+    def _label_id(self, name: str, color: str | None = None) -> str:
         if name not in self._labels:
             existing = self.svc.users().labels().list(userId="me").execute(num_retries=3).get("labels", [])
             for label in existing:
                 self._labels[label["name"]] = label["id"]
         if name not in self._labels:
-            created = self.svc.users().labels().create(userId="me", body={
-                "name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}).execute(num_retries=3)
+            body = {"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}
+            if color:
+                body["color"] = {"backgroundColor": color, "textColor": "#000000"}
+            try:
+                created = self.svc.users().labels().create(userId="me", body=body).execute(num_retries=3)
+            except Exception as e:
+                from googleapiclient.errors import HttpError
+                if not color or not isinstance(e, HttpError) or e.resp.status != 400:
+                    raise
+                # Gmail may reject a palette value; the category still gets a label.
+                body = {k: v for k, v in body.items() if k != "color"}
+                created = self.svc.users().labels().create(userId="me", body=body).execute(num_retries=3)
             self._labels[name] = created["id"]
         return self._labels[name]
+
+    def label_category(self, gmail_id: str, name: str, color: str | None = None) -> None:
+        label_id = self._label_id(f"Kategori/{name}", color)
+        self._messages().modify(userId="me", id=gmail_id, body={
+            "addLabelIds": [label_id]}).execute(num_retries=3)
 
     def fetch_new(self, since: datetime) -> list[dict]:
         query = f"in:inbox after:{int(since.timestamp())}"

@@ -16,7 +16,8 @@ def make_mail(conn, sender="haber@site.com", account="a@gmail.com", subject="Kon
               prediction=None, category="birincil") -> int:
     n = next(_counter)
     mail_id = db.insert_mail(conn, {
-        "account": account, "gmail_id": f"g{n}", "sender": sender, "sender_name": "Ad",
+        # Keep generated training mails separate from raw_mail's g1/g900 ids.
+        "account": account, "gmail_id": f"fixture-{n}", "sender": sender, "sender_name": "Ad",
         "subject": subject, "snippet": "ön izleme", "category": category, "received_at": ts(n),
     })
     if prediction:
@@ -33,6 +34,7 @@ class FakeGmail:
         self.body_fail = body_fail
         self.body_fetches = []
         self.applied, self.reverted, self.since = [], [], None
+        self.category_labels = []
 
     def fetch_new(self, since):
         self.since = since
@@ -48,6 +50,9 @@ class FakeGmail:
 
     def apply(self, gmail_id, action):
         self.applied.append((gmail_id, action))
+
+    def label_category(self, gmail_id, name, color=None):
+        self.category_labels.append((gmail_id, name, color))
 
     def revert(self, gmail_id, action):
         self.reverted.append((gmail_id, action))

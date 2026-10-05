@@ -118,6 +118,77 @@ def cmd_durum() -> int:
     return 0
 
 
+def cmd_kategori_kur() -> int:
+    cfg = config.load_config()
+    if "kategoriler" not in cfg:
+        cfg["kategoriler"] = [dict(c) for c in config.DEFAULT_KATEGORILER]
+        config.save_config(cfg)
+        print("Varsayılan kategoriler kuruldu.")
+    else:
+        print("Mevcut kategori listesi korundu.")
+    for c in config.get_categories(cfg):
+        print(f"{'⭐ ' if c['onemli'] else ''}{c['ad']}: {c['tanim']}")
+    if not cfg["kategoriler"]:
+        print("Kategori listesi boş; kategorilendirme kapalı.")
+    return 0
+
+
+def cmd_kategorile() -> int:
+    # This lock is shared with scheduled and forced runs, for the entire backfill.
+    with (config.home() / "tur.lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            print("Başka bir tur veya kategorilendirme çalışıyor; işlem atlandı.")
+            return 0
+        cfg = config.load_config()
+        categories = config.get_categories(cfg)
+        if not categories:
+            print("Kategoriler tanımlı değil. Kurulum için: mail-ajani kategori-kur")
+            return 0
+        clients, warnings = build_clients(cfg["accounts"])
+        conn = db.connect(config.db_path())
+        counts = {c["ad"]: 0 for c in categories}
+        by_name = {c["ad"]: c for c in categories}
+        failed = 0
+        try:
+            mails = [m for m in db.uncategorized_mails(conn) if m["account"] in clients]
+            examples = learning.recent_examples(conn)
+            for start in range(0, len(mails), classifier.CHUNK):
+                chunk = mails[start:start + classifier.CHUNK]
+                try:
+                    predictions, errors = classifier.classify(chunk, examples, kategoriler=categories)
+                except Exception as e:
+                    predictions, errors = {}, [f"sınıflandırıcı çalışmadı ({e.__class__.__name__})"]
+                warnings.extend(errors)
+                for mail in chunk:
+                    name = getattr(predictions, "categories", {}).get(mail["id"], "")
+                    if not isinstance(name, str) or name not in by_name or mail["id"] not in predictions:
+                        failed += 1
+                        continue
+                    try:
+                        clients[mail["account"]].label_category(mail["gmail_id"], name, by_name[name].get("renk"))
+                    except Exception as e:
+                        from googleapiclient.errors import HttpError
+                        if isinstance(e, HttpError) and e.resp.status == 404:
+                            continue
+                        log.warning("Kategorilendirme etiketi uygulanamadı: mail #%s (%s)",
+                                    mail["id"], e.__class__.__name__)
+                        failed += 1
+                        continue
+                    db.set_category(conn, mail["id"], name)
+                    counts[name] += 1
+        finally:
+            conn.close()
+        for name, count in counts.items():
+            print(f"{name}: {count}")
+        for warning in dict.fromkeys(warnings):
+            print(f"Uyarı: {warning}")
+        if failed:
+            print(f"Kategori veya etiket uygulanamayan mail: {failed}; sonraki çalıştırmada yeniden denenebilir.")
+        return 1 if failed or warnings else 0
+
+
 def cmd_bot_kur() -> int:
     token = getpass.getpass("BotFather'ın verdiği anahtarı yapıştır (ekranda görünmez): ").strip()
     probe = TelegramClient(token, None)
@@ -194,6 +265,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("dinle")
     sub.add_parser("durum")
     sub.add_parser("bot-kur")
+    sub.add_parser("kategori-kur")
+    sub.add_parser("kategorile")
     p_hesap = sub.add_parser("hesap-ekle")
     p_hesap.add_argument("email")
     args = parser.parse_args(argv)
@@ -209,4 +282,8 @@ def main(argv: list[str] | None = None) -> int:
         return cmd_durum()
     if args.cmd == "bot-kur":
         return cmd_bot_kur()
+    if args.cmd == "kategori-kur":
+        return cmd_kategori_kur()
+    if args.cmd == "kategorile":
+        return cmd_kategorile()
     return cmd_hesap_ekle(args.email)

@@ -68,13 +68,18 @@ def card_text(mail) -> str:
             f"👤 <b>{_short_html(name, 400)}</b> &lt;{_short_html(mail['sender'], 350)}&gt;\n"
             f"📝 {_short_html(mail['subject'] or '(konu yok)', 1800)}\n\n"
             f"{_short_html(body, 1000)}\n\n"
-            f"🤖 Tahmin: {prediction}")
+            f"🤖 Tahmin: {prediction}" + category_line(mail))
+
+
+def category_line(mail) -> str:
+    name = mail["content_category"] if "content_category" in mail.keys() else None
+    return "\n🏷 " + _short_html(name, 100) if name else ""
 
 
 def fallback_card_text(mail) -> str:
     return (f"📬 Mail #{mail['id']} · {_short_html(mail['account'], 100)}\n"
             "Telegram ayrıntılı kartı reddetti. Mail Gmail'de kayıtlıdır.\n"
-            f"📝 {_short_html(mail['subject'] or '(konu yok)', 200)}")
+            f"📝 {_short_html(mail['subject'] or '(konu yok)', 200)}" + category_line(mail))
 
 
 def card_keyboard(mail_id: int) -> dict:
@@ -97,7 +102,9 @@ def summary_text(slot_label: str, new_count: int, important_count: int, waiting_
         lines.append("\nKendi yaptıklarım:")
         for i, a in enumerate(autos, 1):
             m = a["mail"]
-            lines.append(f"{i}. {ACTION_DONE[a['action']]} ({SOURCE_TEXT[a['source']]}) · "
+            source = ("kategori: " + _short_html(m["content_category"] or "", 100)
+                      if a["source"] == "kategori" else SOURCE_TEXT[a["source"]])
+            lines.append(f"{i}. {ACTION_DONE[a['action']]} ({source}) · "
                          f"{_short_html(m['sender'] or '', 70)} · {_short_html(m['subject'] or '', 60)}")
     return "\n".join(lines)
 
@@ -120,10 +127,17 @@ def summary_keyboard(autos: list) -> dict | None:
 
 
 def summary_batches(autos: list) -> list[list]:
-    return [autos[i:i + MAX_AUTOS_LISTED] for i in range(0, len(autos), MAX_AUTOS_LISTED)] or [[]]
+    batches, batch = [], []
+    for auto in autos:
+        if batch and (len(batch) == MAX_AUTOS_LISTED or
+                      _utf16_units(summary_text("00:00", 0, 0, 0, batch + [auto])) > 3800):
+            batches.append(batch)
+            batch = []
+        batch.append(auto)
+    return batches + [batch] if batch else batches or [[]]
 
 
-def rules_text(rules, authorities: set[str]) -> str:
+def rules_text(rules, authorities: set[str], kategoriler=()) -> str:
     lines = ["<b>Öğrendiklerim</b>", "", "Kesin kurallar:"]
     shown = list(rules)[:MAX_RULES_LISTED]
     lines += [f"• {escape(r['sender'])} → {PREDICTION_TEXT[r['action']]}" for r in shown] or ["• (henüz yok)"]
@@ -131,6 +145,9 @@ def rules_text(rules, authorities: set[str]) -> str:
         lines.append(f"… ve {len(rules) - MAX_RULES_LISTED} kural daha")
     lines += ["", "Tarz yetkileri (kendi karar verdiğim türler):"]
     lines += [f"• {PREDICTION_TEXT[a]}" for a in sorted(authorities)] or ["• (henüz yok, her şeyi sana soruyorum)"]
+    if kategoriler:
+        lines += ["", "Kategoriler:"]
+        lines += [f"• {'⭐ ' if c['onemli'] else ''}{escape(c['ad'])}" for c in kategoriler]
     return "\n".join(lines)
 
 

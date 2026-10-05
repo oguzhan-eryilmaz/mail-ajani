@@ -63,7 +63,7 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
         categories = {}
         invalid_categories = True
         if not any(w.startswith("Kategori ayarı geçersiz:") for w in warnings + warned):
-            warnings.append(f"Kategori ayarı geçersiz: {e}; bu tur kategorilendirme kapalı.")
+            warnings.append(f"Kategori ayarı geçersiz: {e}; bu tur kategorilendirme kapalı, otomatik çöp ve arşiv de yapılmadı.")
     active = {m["id"]: db.active_decision(conn, m["id"]) for m in pending}
     to_classify = [m for m in pending if
                    (not m["content_category"] if categories else
@@ -125,6 +125,12 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
             else:
                 automatic = learning.auto_action(conn, mail["sender"],
                                                  predictions.get(mail["id"], (None,))[0], authorities)
+                if invalid_categories and automatic and automatic[0] in ("cop", "arsiv"):
+                    # The owner asked for a category guarantee (security, invoice,
+                    # collaboration always important). With an unreadable category
+                    # setting nothing can be checked, so nothing is trashed or
+                    # archived blind; the mail goes out as a card.
+                    automatic = None
             client = clients.get(mail["account"])
             if automatic and not client and categories:
                 warnings.append(f"Mail #{mail['id']} ({mail['account']}): hesap şu an bağlı değil; "

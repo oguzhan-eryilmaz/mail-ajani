@@ -176,7 +176,8 @@ def test_invalid_config_warning_survives_outage_without_duplication(conn, tmp_pa
     assert sum(m["text"].count("Kategori ayarı geçersiz:") for m in tg.sent) == 1
 
 
-def test_invalid_config_retains_unconfigured_sender_rule_behavior(conn, tmp_path, monkeypatch):
+def test_invalid_config_skips_model_for_rule_mail_but_never_trashes_blind(conn, tmp_path, monkeypatch):
+    # Denetim tur 7, E7-1: önceki sözleşme (kural uygulanır) kategori garantisini çiğniyordu.
     monkeypatch.setenv("MAIL_AJANI_HOME", str(tmp_path))
     config.save_config({"kategoriler": "invalid"})
     rule(conn)
@@ -186,8 +187,9 @@ def test_invalid_config_retains_unconfigured_sender_rule_behavior(conn, tmp_path
         pytest.fail("kategoriler kapalıyken gönderen kuralı modeli atlamalı")
 
     stats = tur.run_tur(conn, {"a": g}, tg, forbidden, NOON)
-    assert g.applied == [("g900", "cop")] and g.category_labels == []
+    assert g.applied == [] and g.category_labels == []
     assert stats["warnings"] == 1 and db.pending_mails(conn) == []
+    assert len(cards(tg)) == 1
 
 
 @pytest.mark.parametrize("fail", [False, True])
@@ -332,3 +334,25 @@ def test_attachment_full_body_follows_autoimportant_card_without_persistence(con
     msgs.modify.assert_not_called()
     msgs.trash.assert_not_called()
     msgs.delete.assert_not_called()
+
+
+@pytest.mark.parametrize("action", ["cop", "arsiv"])
+def test_invalid_category_config_never_trashes_or_archives_by_rule(conn, tmp_path, monkeypatch, action):
+    # Denetim tur 7, E7-1: bozuk ayarda çöp kuralı fatura mailini sınıflandırmadan çöpe atıyordu.
+    from datetime import datetime
+    from mail_ajani import db, learning, tur
+    from mail_ajani.config import TZ
+    from tests.helpers import FakeGmail, FakeTg, make_mail, raw_mail, ts
+    monkeypatch.setenv("MAIL_AJANI_HOME", str(tmp_path))
+    config.save_config({"kategoriler": "bozuk"})
+    for i in range(10):
+        mid = make_mail(conn, sender="fatura@sirket.com")
+        db.mark_sent(conn, mid, None, ts(1))
+        learning.record_user_decision(conn, mid, action, ts(100 + i))
+    assert learning.rule_for(conn, "fatura@sirket.com") == action
+    g = FakeGmail("a", [raw_mail("a", "g900", sender="fatura@sirket.com", subject="Ekim faturanız")])
+    tg = FakeTg()
+    stats = tur.run_tur(conn, {"a": g}, tg, lambda m, e, **kw: ({}, []), datetime(2026, 9, 19, 12, 5, tzinfo=TZ))
+    assert g.applied == [] and stats["auto"] == 0
+    assert sum("a:cop:" in str(m["keyboard"]) for m in tg.sent) == 1
+    assert any("Kategori ayarı geçersiz:" in m["text"] for m in tg.sent)

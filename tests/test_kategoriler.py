@@ -78,7 +78,7 @@ def test_install_only_when_key_absent(tmp_path, monkeypatch, capsys, existing):
 
 def test_defaults_include_owner_intent(categories):
     assert [c["ad"] for c in categories] == ["Güvenlik", "Fatura", "İşbirliği", "Yazışma", "Hesap",
-                                             "Geliştirici", "Sosyal", "Bülten"]
+                                             "Geliştirici", "Sosyal", "Bülten", "Diğer"]
     assert [c["ad"] for c in categories if c["onemli"]] == ["Güvenlik", "Fatura", "İşbirliği"]
 
 
@@ -175,7 +175,7 @@ def test_no_usable_category_never_trashes_or_archives(conn, categories, monkeypa
     assert g.applied == [] and g.category_labels == []
     mail = conn.execute("SELECT * FROM mails WHERE gmail_id='g900'").fetchone()
     assert mail["content_category"] is None and db.active_decision(conn, mail["id"]) is None
-    assert len(cards(tg)) == 1 and stats["warnings"] >= 1
+    assert len(cards(tg)) == 1 and stats["warnings"] == 1
     assert "geçerli kategori alınamadı" in tg.sent[-1]["text"]
     assert "SECRET" not in str(tg.sent) + caplog.text + "\n".join(conn.iterdump())
 
@@ -204,7 +204,8 @@ def test_real_cli_fixture_shape_and_legacy_return_shape(categories):
     def runner(cmd, **kw):
         schema = json.loads(cmd[cmd.index("--json-schema") + 1])
         assert "kategori" in schema["properties"]["items"]["items"]["properties"]
-        assert "kategori" not in schema["properties"]["items"]["items"]["required"]
+        assert "kategori" in schema["properties"]["items"]["items"]["required"]
+        assert schema["properties"]["items"]["items"]["properties"]["kategori"]["enum"] == [c["ad"] for c in categories]
         return subprocess.CompletedProcess(cmd, 0, stdout=json.dumps(fixture))
     predictions, errors = classifier.classify([{"id": 1, **raw_mail("a", "g1")}], [], runner=runner)
     action, summary = predictions[1]

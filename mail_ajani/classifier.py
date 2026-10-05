@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 import subprocess
 
 from . import config
@@ -46,7 +47,7 @@ def build_prompt(mails, examples, kategoriler=()) -> str:
     lines += [f"- {e['sender']} | {e['subject']} -> {e['action']}" for e in examples] or ["- (henüz yok)"]
     if kategoriler:
         lines += ["", "## İçerik kategorileri",
-                  "Her mail için kategori alanında aşağıdaki adlardan tam birini seç; hiçbiri uymuyorsa boş dize ver.",
+                  "Her mail için kategori alanında aşağıdaki adlardan tam birini seç; başka kategori uymuyorsa Diğer seç.",
                   "Gönderen, konu ve ön izleme içeriğini birlikte değerlendir; yalnız anahtar kelimelerle karar verme.",
                   "İki kategori uyuyorsa onemli=true olan kategori kazanır.",
                   "Önemli kategorideki mailin kararı onemli olmalı; geçmiş kararlar bunu değiştirmez.",
@@ -106,9 +107,15 @@ def parse_output(stdout: str, expected_ids: set[int], kategoriler=()) -> Predict
     return out
 
 
-def _command() -> list[str]:
+def _command(kategoriler=()) -> list[str]:
+    schema = SCHEMA
+    if kategoriler:
+        schema = deepcopy(SCHEMA)
+        item = schema["properties"]["items"]["items"]
+        item["properties"]["kategori"]["enum"] = [c["ad"] for c in kategoriler]
+        item["required"].append("kategori")
     return [config.CLAUDE_BIN, "-p", "--model", "sonnet", "--tools", "", "--setting-sources", "",
-            "--no-session-persistence", "--output-format", "json", "--json-schema", json.dumps(SCHEMA)]
+            "--no-session-persistence", "--output-format", "json", "--json-schema", json.dumps(schema)]
 
 
 def classify(mails, examples, runner=subprocess.run, kategoriler=None) -> tuple[Predictions, list[str]]:
@@ -117,7 +124,7 @@ def classify(mails, examples, runner=subprocess.run, kategoriler=None) -> tuple[
     for start in range(0, len(mails), CHUNK):
         chunk = mails[start:start + CHUNK]
         try:
-            proc = runner(_command(), input=build_prompt(chunk, examples, kategoriler), capture_output=True, text=True,
+            proc = runner(_command(kategoriler), input=build_prompt(chunk, examples, kategoriler), capture_output=True, text=True,
                           timeout=TIMEOUT_S, cwd=str(config.home()))
             if proc.returncode != 0:
                 raise ClassifierError("claude çağrısı başarısız")

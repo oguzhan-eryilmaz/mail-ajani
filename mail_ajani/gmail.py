@@ -1,6 +1,7 @@
 import base64
 import json
 import re
+import unicodedata
 from datetime import datetime
 from email.message import Message
 from email.utils import parseaddr
@@ -49,17 +50,32 @@ def _clean_body(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", text).strip()
 
 
-def _body_text(payload: dict) -> str:
+class BodyUnreadableError(Exception):
+    """A body exists, but none of its content could be read as text."""
+
+
+def _body_text(payload: dict, attachment_data=None) -> str:
     plain, html = [], []
+    has_body = False
 
     def walk(part):
+        nonlocal has_body
         headers = Message()
         for header in part.get("headers", []):
             headers[header["name"]] = header["value"]
         if part.get("filename") or headers.get_content_disposition() == "attachment":
             return
         mime = part.get("mimeType", "").lower()
-        data = part.get("body", {}).get("data")
+        body = part.get("body", {})
+        data = body.get("data")
+        has_body = has_body or bool(data or body.get("attachmentId") or body.get("size"))
+        if mime in {"text/plain", "text/html"}:
+            if not data and body.get("attachmentId") and attachment_data:
+                try:
+                    data = attachment_data(body["attachmentId"])
+                except Exception:
+                    # An alternative MIME part may still supply readable text.
+                    data = None
         if data and mime in {"text/plain", "text/html"}:
             raw = base64.urlsafe_b64decode(data + "=" * (-len(data) % 4))
             charset = headers.get_content_charset() or "utf-8"
@@ -79,7 +95,10 @@ def _body_text(payload: dict) -> str:
             walk(child)
 
     walk(payload)
-    return _clean_body("\n\n".join(plain or html))
+    text = _clean_body("\n\n".join(plain or html))
+    if not text and has_body:
+        raise BodyUnreadableError("tam metin okunamadı")
+    return text
 
 
 class GmailAuthError(Exception):
@@ -103,26 +122,43 @@ class GmailClient:
     def _messages(self):
         return self.svc.users().messages()
 
+    @staticmethod
+    def _label_key(name: str) -> str:
+        return unicodedata.normalize("NFC", name).casefold()
+
+    def _refresh_labels(self):
+        existing = self.svc.users().labels().list(userId="me").execute(num_retries=3).get("labels", [])
+        self._labels = {self._label_key(label["name"]): label["id"] for label in existing}
+
     def _label_id(self, name: str, color: str | None = None) -> str:
-        if name not in self._labels:
-            existing = self.svc.users().labels().list(userId="me").execute(num_retries=3).get("labels", [])
-            for label in existing:
-                self._labels[label["name"]] = label["id"]
-        if name not in self._labels:
+        key = self._label_key(name)
+        if key not in self._labels:
+            self._refresh_labels()
+        if key not in self._labels:
+            from googleapiclient.errors import HttpError
+
             body = {"name": name, "labelListVisibility": "labelShow", "messageListVisibility": "show"}
             if color:
                 body["color"] = {"backgroundColor": color, "textColor": "#000000"}
             try:
-                created = self.svc.users().labels().create(userId="me", body=body).execute(num_retries=3)
-            except Exception as e:
-                from googleapiclient.errors import HttpError
-                if not color or not isinstance(e, HttpError) or e.resp.status != 400:
+                try:
+                    created = self.svc.users().labels().create(userId="me", body=body).execute(num_retries=3)
+                except HttpError as e:
+                    if not color or e.resp.status != 400:
+                        raise
+                    # Gmail may reject a palette value; the category still gets a label.
+                    body = {k: v for k, v in body.items() if k != "color"}
+                    created = self.svc.users().labels().create(userId="me", body=body).execute(num_retries=3)
+            except HttpError as e:
+                if e.resp.status != 409:
                     raise
-                # Gmail may reject a palette value; the category still gets a label.
-                body = {k: v for k, v in body.items() if k != "color"}
-                created = self.svc.users().labels().create(userId="me", body=body).execute(num_retries=3)
-            self._labels[name] = created["id"]
-        return self._labels[name]
+                # A concurrent creator or a stale list may have hidden this label.
+                self._refresh_labels()
+                if key not in self._labels:
+                    raise
+            else:
+                self._labels[key] = created["id"]
+        return self._labels[key]
 
     def label_category(self, gmail_id: str, name: str, color: str | None = None) -> None:
         label_id = self._label_id(f"Kategori/{name}", color)
@@ -154,7 +190,12 @@ class GmailClient:
 
     def fetch_body(self, gmail_id: str) -> str:
         msg = self._messages().get(userId="me", id=gmail_id, format="full").execute(num_retries=3)
-        return _body_text(msg.get("payload", {}))
+
+        def attachment_data(attachment_id):
+            return self._messages().attachments().get(
+                userId="me", messageId=gmail_id, id=attachment_id).execute(num_retries=3).get("data")
+
+        return _body_text(msg.get("payload", {}), attachment_data)
 
     def count_since(self, since: datetime, limit: int) -> int:
         # Cheap pre-check for backlog scans: ids only, stops just past the limit.

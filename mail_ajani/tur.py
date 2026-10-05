@@ -56,7 +56,14 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
             warnings.append(f"{account}: mailler alınamadı ({e.__class__.__name__})")
 
     pending = db.pending_mails(conn)
-    categories = {c["ad"]: c for c in config.get_categories()}
+    invalid_categories = False
+    try:
+        categories = {c["ad"]: c for c in config.get_categories()}
+    except ValueError as e:
+        categories = {}
+        invalid_categories = True
+        if not any(w.startswith("Kategori ayarı geçersiz:") for w in warnings + warned):
+            warnings.append(f"Kategori ayarı geçersiz: {e}; bu tur kategorilendirme kapalı.")
     active = {m["id"]: db.active_decision(conn, m["id"]) for m in pending}
     to_classify = [m for m in pending if
                    (not m["content_category"] if categories else
@@ -65,11 +72,13 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
     predictions = {}
     if to_classify:
         try:
-            kwargs = {"kategoriler": list(categories.values())} if categories else {}
+            kwargs = {"kategoriler": list(categories.values())} if categories or invalid_categories else {}
             predictions, errors = classify_fn(to_classify, learning.recent_examples(conn), **kwargs)
         except Exception as e:
             predictions, errors = {}, [f"sınıflandırıcı çalışmadı ({e.__class__.__name__})"]
-        warnings += [f"Sınıflandırma yapılamadı, bazı mailler tahminsiz geldi: {e}" for e in errors]
+        if not categories:
+            warnings += [f"Sınıflandırma yapılamadı, bazı mailler tahminsiz geldi: {e}" for e in errors]
+        unusable_category = False
         # A previous failed send may have left a prediction; fallback must clear it.
         for mail in to_classify:
             db.set_prediction(conn, mail["id"], *predictions.get(mail["id"], (None, None)))
@@ -89,7 +98,9 @@ def run_tur(conn, clients: dict, tg, classify_fn, now: datetime, force: bool = F
                             warnings.append(f"Mail #{mail['id']} ({mail['account']}): kategori etiketi "
                                             f"uygulanamadı ({e.__class__.__name__}); kategori yerelde kayıtlı.")
                 else:
-                    warnings.append(f"Mail #{mail['id']}: geçerli kategori alınamadı; otomatik işlem yapılmadı.")
+                    unusable_category = True
+        if unusable_category or categories and errors:
+            warnings.append("Bazı mailler için geçerli kategori alınamadı; bu maillerde otomatik işlem yapılmadı.")
 
     # Category writes above must be visible to priority checks and cards.
     pending = [db.get_mail(conn, m["id"]) for m in pending]

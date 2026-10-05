@@ -1,11 +1,13 @@
 import json
 import os
+import tempfile
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 TZ = ZoneInfo("Europe/Istanbul")
 CLAUDE_BIN = os.environ.get("MAIL_AJANI_CLAUDE", str(Path.home() / ".local/bin/claude"))
 KEYRING_SERVICE = "mail-ajani"
+FALLBACK_KATEGORI = {"ad": "Diğer", "tanim": "yukarıdakilerin hiçbirine girmeyen mailler", "onemli": False}
 
 DEFAULT_KATEGORILER = [
     {"ad": "Güvenlik", "tanim": "giriş ve cihaz uyarıları, şifre/passkey/2FA değişiklikleri, yetki ve OAuth izinleri, hesap güvenliği bildirimleri", "onemli": True},
@@ -16,6 +18,7 @@ DEFAULT_KATEGORILER = [
     {"ad": "Geliştirici", "tanim": "GitHub, Vercel ve benzeri araçların depo, issue, PR, dağıtım bildirimleri", "onemli": False},
     {"ad": "Sosyal", "tanim": "LinkedIn, Instagram, YouTube ve benzeri platformların davet, öneri, etkinlik ve özet bildirimleri", "onemli": False},
     {"ad": "Bülten", "tanim": "bülten, ürün duyurusu, kampanya, pazarlama ve tanıtım mailleri", "onemli": False},
+    dict(FALLBACK_KATEGORI),
 ]
 
 
@@ -25,13 +28,24 @@ def get_categories(cfg: dict | None = None) -> list[dict]:
         raise ValueError("kategoriler bir liste olmalı")
     names = set()
     for c in categories:
-        if (not isinstance(c, dict) or not isinstance(c.get("ad"), str)
-                or not c["ad"].strip() or len(c["ad"]) > 60 or c["ad"] in names
-                or not isinstance(c.get("tanim"), str) or type(c.get("onemli")) is not bool
-                or ("renk" in c and not isinstance(c["renk"], str))):
-            raise ValueError("kategori adı, tanımı, önem veya renk alanı geçersiz")
+        if not isinstance(c, dict):
+            raise ValueError("her kategori bir nesne olmalı")
+        if not isinstance(c.get("ad"), str) or not c["ad"].strip() or len(c["ad"]) > 60:
+            raise ValueError("kategori adı boş olamaz; en fazla 60 karakterlik metin olmalı")
+        if c["ad"] in names:
+            raise ValueError("kategori adları yinelenemez")
+        if not isinstance(c.get("tanim"), str):
+            raise ValueError("kategori tanımı metin olmalı")
+        if type(c.get("onemli")) is not bool:
+            raise ValueError("kategori onemli alanı boolean olmalı")
+        if "renk" in c and not isinstance(c["renk"], str):
+            raise ValueError("kategori renk alanı metin olmalı")
         names.add(c["ad"])
-    return categories
+    # Do not rewrite or mutate the operator's list when supplying the fallback.
+    out = [dict(c, onemli=False) if c["ad"] == "Diğer" else dict(c) for c in categories]
+    if out and "Diğer" not in names:
+        out.append(dict(FALLBACK_KATEGORI))
+    return out
 
 
 def home() -> Path:
@@ -66,4 +80,17 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    (home() / "config.json").write_text(json.dumps(cfg, indent=2, ensure_ascii=False))
+    directory = home()
+    content = json.dumps(cfg, indent=2, ensure_ascii=False)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory,
+                                         prefix=".config-", suffix=".tmp", delete=False) as f:
+            temporary = Path(f.name)
+            f.write(content)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, directory / "config.json")
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)

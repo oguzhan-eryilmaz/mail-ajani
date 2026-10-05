@@ -11,7 +11,7 @@ from datetime import datetime
 from unittest.mock import MagicMock
 
 from mail_ajani.config import TZ
-from mail_ajani.gmail import GmailClient
+from mail_ajani.gmail import BodyUnreadableError, GmailClient
 
 
 def body_part(mime, text, charset=None, *, encoding="utf-8", filename=""):
@@ -77,12 +77,25 @@ def test_fetch_body_missing_unknown_or_wrong_charset_uses_replacement(charset, d
     assert read_body(body_part("text/plain", data, charset)) == expected
 
 
-@pytest.mark.parametrize("payload", [{}, {"mimeType": "image/png", "body": {"data": "AA"}},
-    body_part("text/plain", " \n \n"), body_part("text/plain", "ek", filename="ek.txt"),
-    {"mimeType": "text/plain", "body": {"attachmentId": "external"}},
-    body_part("text/html", "<script>secret</script><style>secret</style>")])
+@pytest.mark.parametrize("payload", [{},
+    body_part("text/plain", "ek", filename="ek.txt")])
 def test_fetch_body_returns_empty_when_no_readable_text(payload):
     assert read_body(payload) == ""
+
+
+@pytest.mark.parametrize("payload", [{"mimeType": "image/png", "body": {"data": "AA"}},
+    body_part("text/plain", " \n \n"),
+    {"mimeType": "text/plain", "body": {"attachmentId": "external"}},
+    body_part("text/html", "<script>secret</script><style>secret</style>")])
+def test_fetch_body_signals_present_but_unreadable_body(payload):
+    svc, msgs, lab = service_with([{"id": "m1", "payload": payload}])
+    msgs.attachments.return_value.get.return_value.execute.return_value = {}
+    with pytest.raises(BodyUnreadableError, match="tam metin okunamadı"):
+        GmailClient("a", svc).fetch_body("m1")
+    msgs.modify.assert_not_called()
+    msgs.trash.assert_not_called()
+    msgs.delete.assert_not_called()
+    assert lab.mock_calls == []
 
 
 def test_fetch_body_empty_plain_falls_back_to_readable_html():

@@ -10,7 +10,13 @@ log = logging.getLogger(__name__)
 
 def _rules_view(conn):
     rules, auth = learning.list_rules(conn), learning.style_authorities(conn)
-    return render.rules_text(rules, auth, config.get_categories()), render.rules_keyboard(rules, auth)
+    warning = ""
+    try:
+        categories = config.get_categories()
+    except ValueError as e:
+        categories = []
+        warning = f"\nKategori ayarı geçersiz: {e}."
+    return render.rules_text(rules, auth, categories) + warning, render.rules_keyboard(rules, auth)
 
 
 def _on_action(conn, cq, action, mail_id, clients, tg, now_iso):

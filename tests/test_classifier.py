@@ -64,7 +64,7 @@ def test_classify_chunks_and_collects_errors():
     assert len(errors) == 1 and "başarısız" in errors[0]
     assert "rate limit" not in errors[0]  # raw CLI output must not be exposed
     cmd = calls[0]
-    assert cmd[cmd.index("--model") + 1] == "sonnet"
+    assert cmd[cmd.index("--model") + 1] == "haiku"
     assert "--bare" not in cmd
     assert cmd[cmd.index("--tools") + 1] == ""
 

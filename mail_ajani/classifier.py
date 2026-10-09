@@ -114,7 +114,7 @@ def _command(kategoriler=()) -> list[str]:
         item = schema["properties"]["items"]["items"]
         item["properties"]["kategori"]["enum"] = [c["ad"] for c in kategoriler]
         item["required"].append("kategori")
-    return [config.CLAUDE_BIN, "-p", "--model", "sonnet", "--tools", "", "--setting-sources", "",
+    return [config.CLAUDE_BIN, "-p", "--model", "haiku", "--tools", "", "--setting-sources", "",
             "--no-session-persistence", "--output-format", "json", "--json-schema", json.dumps(schema)]
 
 
